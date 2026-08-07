@@ -13,7 +13,9 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
@@ -37,6 +39,7 @@ class FloatingBallService : Service() {
     companion object {
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "floating_ball"
+        private const val TAG = "AdAutoBall"
 
         fun start(context: Context) {
             val intent = Intent(context, FloatingBallService::class.java)
@@ -57,7 +60,15 @@ class FloatingBallService : Service() {
     private var initialTouchX = 0f
     private var initialTouchY = 0f
     private var moved = false
+    private var longPressed = false
     private val touchSlop by lazy { ViewConfiguration.get(this).scaledTouchSlop }
+    private val longPressHandler = Handler(Looper.getMainLooper())
+    private val longPressRunnable = Runnable {
+        longPressed = true
+        Log.i(TAG, "long-press triggered, opening settings")
+        openMainActivity()
+        ballView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -107,11 +118,9 @@ class FloatingBallService : Service() {
         }
 
         val view = LayoutInflater.from(this).inflate(R.layout.view_floating_ball, null)
+        // 注意：OnTouchListener 对事件返回 true 会跳过 View.onTouchEvent，导致
+        // setOnLongClickListener 永不触发；因此长按检测在 buildTouchListener 内手动实现。
         view.setOnTouchListener(buildTouchListener(view, params))
-        view.setOnLongClickListener {
-            openMainActivity()
-            true
-        }
 
         try {
             windowManager.addView(view, params)
@@ -127,17 +136,26 @@ class FloatingBallService : Service() {
         View.OnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
+                    longPressed = false
                     initialX = params.x
                     initialY = params.y
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
                     moved = false
+                    Log.d(TAG, "touch down at ${event.rawX.toInt()},${event.rawY.toInt()}")
+                    longPressHandler.postDelayed(
+                        longPressRunnable,
+                        ViewConfiguration.getLongPressTimeout().toLong(),
+                    )
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = event.rawX - initialTouchX
                     val dy = event.rawY - initialTouchY
-                    if (!moved && (abs(dx) > touchSlop || abs(dy) > touchSlop)) moved = true
+                    if (!moved && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+                        moved = true
+                        longPressHandler.removeCallbacks(longPressRunnable)
+                    }
                     if (moved) {
                         params.x = (initialX + dx).toInt()
                         params.y = (initialY + dy).toInt()
@@ -146,7 +164,13 @@ class FloatingBallService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!moved) onBallTap()
+                    longPressHandler.removeCallbacks(longPressRunnable)
+                    if (!moved && !longPressed) onBallTap()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    longPressHandler.removeCallbacks(longPressRunnable)
+                    longPressed = false
                     true
                 }
                 else -> false
@@ -156,6 +180,7 @@ class FloatingBallService : Service() {
     private fun onBallTap() {
         val enabled = !SettingsManager.adSkipEnabled
         SettingsManager.adSkipEnabled = enabled
+        Log.i(TAG, "ball tapped, adSkipEnabled -> $enabled")
         updateBallStyle()
         Toast.makeText(
             this,
@@ -180,6 +205,7 @@ class FloatingBallService : Service() {
     }
 
     private fun removeBall() {
+        longPressHandler.removeCallbacksAndMessages(null)
         ballView?.let { v ->
             try {
                 windowManager.removeView(v)
