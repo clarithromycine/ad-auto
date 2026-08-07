@@ -4,20 +4,30 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.os.SystemClock
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 
 /**
- * 广告检测器：遍历当前活动窗口的节点树，按 AdRules 匹配并执行跳过动作。
+ * 广告检测器：遍历当前屏幕上各窗口的节点树，按 AdRules 匹配并执行跳过动作。
  */
 class AdDetector(private val service: AccessibilityService) {
 
+    private companion object {
+        const val TAG = "AdDetector"
+    }
     /** 两次跳过动作之间的最小间隔，避免重复触发 */
     private val minActionInterval = 1500L
     private var lastActionAt = 0L
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {
-        if (!SettingsManager.adSkipEnabled) return
+        if (!SettingsManager.adSkipEnabled) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                Log.d(TAG, "自动跳过已关闭，界面变化不检测")
+            }
+            return
+        }
         val type = event.eventType
         if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
@@ -36,12 +46,12 @@ class AdDetector(private val service: AccessibilityService) {
     }
 
     private fun detectAndAct(onResult: (String) -> Unit = {}) {
-        val root = service.rootInActiveWindow ?: run {
+        val nodes = ArrayList<AccessibilityNodeInfo>()
+        collectFromAllWindows(nodes)
+        if (nodes.isEmpty()) {
             onResult("无障碍服务尚未就绪")
             return
         }
-        val nodes = ArrayList<AccessibilityNodeInfo>()
-        collectNodes(root, nodes)
 
         val action = AdRules.match(nodes)
         if (action != null) {
@@ -51,7 +61,9 @@ class AdDetector(private val service: AccessibilityService) {
                 return
             }
             lastActionAt = now
+            Log.i(TAG, "匹配到广告: ${action.type} (${action.reason})")
             val ok = perform(action)
+            Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
         } else {
             onResult("当前界面未检测到广告")
@@ -108,6 +120,30 @@ class AdDetector(private val service: AccessibilityService) {
             for (i in 0 until node.childCount) {
                 stack.add(node.getChild(i) ?: continue)
             }
+        }
+    }
+
+    /**
+     * 收集屏幕上所有交互窗口（应用窗口 + 系统弹窗/悬浮广告等）的节点。
+     * 广告文案常出现在非活动窗口（弹窗/WebView 覆盖层），仅用
+     * rootInActiveWindow 会漏检，这里全部收集以提高召回。
+     */
+    private fun collectFromAllWindows(out: MutableList<AccessibilityNodeInfo>) {
+        val windows = try {
+            service.windows
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        for (win in windows) {
+            if (win.type != AccessibilityWindowInfo.TYPE_APPLICATION &&
+                win.type != AccessibilityWindowInfo.TYPE_SYSTEM
+            ) continue
+            val root = win.root ?: continue
+            collectNodes(root, out)
+        }
+        // 兜底：某些设备上 windows 列表为空时退回活动窗口
+        if (out.isEmpty()) {
+            service.rootInActiveWindow?.let { collectNodes(it, out) }
         }
     }
 

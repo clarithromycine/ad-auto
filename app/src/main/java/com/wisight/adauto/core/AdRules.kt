@@ -29,8 +29,8 @@ object AdRules {
 
     /** “上滑继续观看短剧”类广告关键字 */
     val SWIPE_UP_KEYWORDS = listOf(
-        "上滑继续观看", "上滑继续", "向上滑动继续观看", "继续观看短剧",
-        "上滑解锁", "上滑看下一集",
+        "上滑继续观看", "上滑继续", "上滑继续看短剧", "上滑继续看", "上滑看短剧",
+        "向上滑动继续观看", "继续观看短剧", "上滑解锁", "上滑看下一集",
     )
 
     /** 广告上下文关键字，用于降低误触概率 */
@@ -102,17 +102,21 @@ object AdRules {
                 n.contentDescription?.toString()?.let { append(it).append(' ') }
             }
         }
+        // 去掉空白后做匹配，兼容“上滑 继续看短剧”这类带空格写法
+        val compactText = pageText.replace(Regex("\\s+"), "")
 
         // 1) “上滑继续观看短剧”类广告 -> 上滑
-        if (SWIPE_UP_KEYWORDS.any { pageText.contains(it) }) {
+        if (SWIPE_UP_KEYWORDS.any { pageText.contains(it) || compactText.contains(it) }) {
             return AdAction(AdActionType.SWIPE_UP, reason = "上滑继续观看")
         }
 
         // 广告上下文：出现“广告”字样，或倒计时（如 “5秒后可继续”、“3s”)
-        val hasCountdown = COUNTDOWN_KEYWORDS.any { pageText.contains(it, ignoreCase = true) }
-            || pageText.contains(COUNTDOWN_REGEX)
-        val hasAdContext = AD_CONTEXT_KEYWORDS.any { pageText.contains(it, ignoreCase = true) }
-            || hasCountdown
+        val hasCountdown = COUNTDOWN_KEYWORDS.any {
+            pageText.contains(it, ignoreCase = true) || compactText.contains(it, ignoreCase = true)
+        } || pageText.contains(COUNTDOWN_REGEX) || compactText.contains(COUNTDOWN_REGEX)
+        val hasAdContext = AD_CONTEXT_KEYWORDS.any {
+            pageText.contains(it, ignoreCase = true) || compactText.contains(it, ignoreCase = true)
+        } || hasCountdown
 
         // 2) 内置点击规则
         for (rule in CLICK_RULES) {
