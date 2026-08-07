@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">广告快跳</string>
+
+    <string name="accessibility_service_label">广告快跳无障碍服务</string>
+    <string name="accessibility_service_desc">自动检测当前界面是否处于广告状态，并自动点击“跳过”或执行上滑等操作跳过广告。本服务仅用于跳过应用内广告，不会读取你的个人隐私数据。</string>
+
+    <string name="main_title">广告快跳 · 悬浮球助手</string>
+    <string name="main_subtitle">常驻悬浮球 + 无障碍自动跳过广告</string>
+
+    <string name="section_permission">权限设置</string>
+    <string name="permission_accessibility_title">无障碍服务</string>
+    <string name="permission_accessibility_desc">用于读取界面结构、自动点击“跳过”按钮、执行上滑手势</string>
+    <string name="permission_overlay_title">悬浮窗权限</string>
+    <string name="permission_overlay_desc">用于在屏幕左上角显示常驻控制球</string>
+    <string name="permission_notification_title">通知权限</string>
+    <string name="permission_notification_desc">用于展示悬浮球前台服务通知（Android 13 及以上）</string>
+
+    <string name="status_enabled">已开启</string>
+    <string name="status_disabled">未开启</string>
+    <string name="btn_open">去开启</string>
+    <string name="btn_grant">去授权</string>
+
+    <string name="section_feature">功能设置</string>
+    <string name="feature_skip_title">自动跳过广告</string>
+    <string name="feature_skip_desc">检测到广告时自动点击“跳过”/“关闭”或执行上滑手势</string>
+    <string name="feature_ball_title">显示悬浮球</string>
+    <string name="feature_ball_desc">在左上角显示可拖动的控制球，点击可快捷开关自动跳过</string>
+
+    <string name="section_rules">规则设置</string>
+    <string name="rule_custom_title">自定义“跳过”按钮关键词</string>
+    <string name="rule_custom_desc">用逗号分隔，出现这些文字的按钮会被自动点击（默认已包含：跳过、跳过广告、关闭广告、知道了）</string>
+    <string name="rule_custom_hint">例如：跳转,继续观看,去看正片</string>
+    <string name="btn_save">保存规则</string>
+
+    <string name="toast_rule_saved">规则已保存</string>
+    <string name="toast_accessibility_required">请先开启无障碍服务</string>
+    <string name="toast_overlay_required">请先授予悬浮窗权限</string>
+    <string name="toast_ball_started">悬浮球已启动</string>
+    <string name="toast_ball_stopped">悬浮球已停止</string>
+    <string name="toast_skip_on">自动跳过广告已开启</string>
+    <string name="toast_skip_off">自动跳过广告已关闭</string>
+
+    <string name="ball_tap_hint">点击：快捷开关自动跳过 | 长按：打开设置</string>
+    <string name="notif_channel_ball">悬浮球服务</string>
+    <string name="notif_ball_title">广告快跳运行中</string>
+    <string name="notif_ball_text">悬浮球已就位，正在自动跳过广告</string>
+
+    <string name="btn_scan_now">立即检测当前界面</string>
+    <string name="toast_no_ad">当前界面未检测到广告</string>
+    <string name="toast_ad_skipped">检测到广告，已自动跳过</string>
+</resources>

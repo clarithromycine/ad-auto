@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#3D5AFE</color>
+    <color name="primary_dark">#0039CB</color>
+    <color name="primary_light">#818CF8</color>
+    <color name="accent">#00B0FF</color>
+
+    <color name="ball_start">#7C4DFF</color>
+    <color name="ball_end">#448AFF</color>
+    <color name="ball_disabled">#9E9E9E</color>
+
+    <color name="bg_page">#F4F6FB</color>
+    <color name="text_primary">#1A1A2E</color>
+    <color name="text_secondary">#6B7280</color>
+
+    <color name="status_green">#22C55E</color>
+    <color name="status_red">#EF4444</color>
+
+    <color name="ic_launcher_background">#3D5AFE</color>
+</resources>

@@ -1,0 +1,19 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+*.aab
+
+# 本地调试截图，勿提交
+/screen_*.png
+
+# 本地签名文件与配置，勿提交
+/keystore/
+/keystore.properties
