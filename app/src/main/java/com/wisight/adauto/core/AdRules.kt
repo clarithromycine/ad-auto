@@ -33,6 +33,19 @@ object AdRules {
         "向上滑动继续观看", "继续观看短剧", "上滑解锁", "上滑看下一集",
     )
 
+    /**
+     * 正剧播放界面的特征控件文字：出现则判定为“正常短剧播放”，绝不执行滑动/点击。
+     * （红果短剧等播放器在正常播放时会显示这些原生控件，而穿山甲 SurfaceView
+     * 广告期间这些控件不出现 —— 用于保护正剧不被误伤）
+     */
+    val PLAYBACK_CONTROL_KEYWORDS = listOf(
+        "倍速", "选集", "热评", "分享", "评论", "展开", "暂停", "下一集",
+        "全集", "已完结", "作者声明", "跟播", "点赞", "收藏", "弹幕",
+    )
+
+    /** 正剧播放特征：剧集标题，如“第4集” */
+    val EPISODE_REGEX = Regex("第\\d+集")
+
     /** 广告上下文关键字，用于降低误触概率 */
     val AD_CONTEXT_KEYWORDS = listOf("广告", "advertisement")
 
@@ -105,9 +118,36 @@ object AdRules {
         // 去掉空白后做匹配，兼容“上滑 继续看短剧”这类带空格写法
         val compactText = pageText.replace(Regex("\\s+"), "")
 
+        // 0) 正剧播放保护：出现播放器控件特征（第X集/倍速/选集/热评等）
+        //    说明当前是正常短剧播放，绝不执行滑动/点击，避免误伤正剧内容。
+        val hasPlaybackControls = PLAYBACK_CONTROL_KEYWORDS.any {
+            pageText.contains(it) || compactText.contains(it)
+        } || compactText.contains(EPISODE_REGEX)
+        if (hasPlaybackControls) return null
+
         // 1) “上滑继续观看短剧”类广告 -> 上滑
         if (SWIPE_UP_KEYWORDS.any { pageText.contains(it) || compactText.contains(it) }) {
-            return AdAction(AdActionType.SWIPE_UP, reason = "上滑继续观看")
+            // 附带匹配到的节点，便于日志输出提示词精确坐标
+            val matched = nodes.firstOrNull { n ->
+                val t = n.text?.toString().orEmpty()
+                val d = n.contentDescription?.toString().orEmpty()
+                SWIPE_UP_KEYWORDS.any { kw -> t.contains(kw) || d.contains(kw) }
+            }
+            return AdAction(AdActionType.SWIPE_UP, matched, reason = "上滑继续观看")
+        }
+
+        // 1.5) 穿山甲 SurfaceView 视频广告（红果短剧等）：
+        // 广告提示词画在视频 Surface 上，无障碍树读不到任何文字（关键字匹配失效）。
+        // 但广告上屏时会出现原生“立即领取”按钮，且此时没有任何正剧播放控件
+        // （上面的 hasPlaybackControls 已提前拦截正剧）。据此判定为广告 -> 直接上滑。
+        val claimCta = nodes.firstOrNull { n ->
+            n.packageName?.toString() == "com.phoenix.read" &&
+                (n.text?.toString().orEmpty().contains("立即领取") ||
+                    n.contentDescription?.toString().orEmpty().contains("立即领取")) &&
+                (n.isClickable || findClickable(n) != null)
+        }
+        if (claimCta != null) {
+            return AdAction(AdActionType.SWIPE_UP, claimCta, reason = "穿山甲广告(立即领取)")
         }
 
         // 广告上下文：出现“广告”字样，或倒计时（如 “5秒后可继续”、“3s”)

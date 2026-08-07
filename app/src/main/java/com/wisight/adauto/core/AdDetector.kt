@@ -19,6 +19,14 @@ class AdDetector(private val service: AccessibilityService) {
     }
     /** 两次跳过动作之间的最小间隔，避免重复触发 */
     private val minActionInterval = 1500L
+    /**
+     * 穿山甲广告（"立即领取"触发）的冷却时间：
+     * 广告被滑走后"立即领取"按钮可能短暂残留，若用默认 1500ms 会重复滑动，
+     * 这里给更长的冷却以留出广告消失/界面切换的时间。
+     */
+    private val pangleAdCooldown = 6000L
+    /** 下次允许执行动作的时间戳 */
+    private var nextAllowedAt = 0L
     private var lastActionAt = 0L
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -33,11 +41,33 @@ class AdDetector(private val service: AccessibilityService) {
             type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
 
+        // 窗口切换时打印窗口结构，用于排查“穿山甲广告窗口”的可检测特征
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            logWindows()
+        }
+
         // 内容变化事件非常频繁，做节流
         val now = SystemClock.uptimeMillis()
         if (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED && now - lastActionAt < 800) return
 
         detectAndAct()
+    }
+
+    /** 打印当前所有无障碍窗口的结构，排查广告窗口特征 */
+    private fun logWindows() {
+        try {
+            val wins = service.windows
+            val sb = StringBuilder("windows[${wins.size}]:")
+            for (w in wins) {
+                val root = w.root
+                val pkg = root?.packageName?.toString().orEmpty()
+                val cls = root?.className?.toString().orEmpty()
+                sb.append(" {t=${w.type},a=${w.isActive},pkg=$pkg,cls=$cls}")
+            }
+            Log.i(TAG, sb.toString())
+        } catch (t: Throwable) {
+            Log.w(TAG, "logWindows failed: $t")
+        }
     }
 
     /** 供“立即检测”按钮调用 */
@@ -56,12 +86,19 @@ class AdDetector(private val service: AccessibilityService) {
         val action = AdRules.match(nodes)
         if (action != null) {
             val now = SystemClock.uptimeMillis()
-            if (now - lastActionAt < minActionInterval) {
+            if (now < nextAllowedAt) {
                 recycleAll(nodes)
                 return
             }
+            // 穿山甲广告（"立即领取"触发）用更长冷却：广告滑走后按钮可能残留，避免重复滑动
+            val cooldown = if (action.reason.contains("穿山甲广告")) pangleAdCooldown else minActionInterval
+            nextAllowedAt = now + cooldown
             lastActionAt = now
             Log.i(TAG, "匹配到广告: ${action.type} (${action.reason})")
+            // 打印匹配节点文本，便于排查（注意：穿山甲 SurfaceView 视频广告的文字不在无障碍树里）
+            action.node?.let { n ->
+                Log.i(TAG, "匹配节点 text=${n.text?.toString().orEmpty().take(20)} class=${n.className}")
+            }
             val ok = perform(action)
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
@@ -104,6 +141,7 @@ class AdDetector(private val service: AccessibilityService) {
             val toY = if (up) h * 0.25f else h * 0.75f
             path.moveTo(w * 0.5f, fromY)
             path.lineTo(w * 0.5f, toY)
+            Log.i(TAG, "swipe: display=${w}x$h path=(${w * 0.5f},$fromY)->(${w * 0.5f},$toY)")
         }
         val stroke = GestureDescription.StrokeDescription(path, 0, 250)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
