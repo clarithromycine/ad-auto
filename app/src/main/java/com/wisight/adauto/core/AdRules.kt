@@ -62,6 +62,37 @@ object AdRules {
     /** 倒计时正则：匹配 “3秒后”“5s后可继续”“广告倒计时 3” 等 */
     val COUNTDOWN_REGEX = Regex("\\d+\\s*(?:秒|s|S)\\s*(?:后|后可继续|后继续|后可观看|后观看|后播放)?")
 
+    /**
+     * 倒计时数字提取正则（用于精确安排“倒计时结束”后的重扫时机）：
+     * - “3秒后可继续”“5s后” → (\\d+)\\s*(?:秒|s|S)
+     * - “广告倒计时 3”“广告 3s” → (?:广告|倒计时)\\s*(\\d+)(?:\\s*(?:秒|s|S))?
+     */
+    private val COUNTDOWN_NUMBER_REGEX = Regex(
+        "(?:广告|倒计时)\\s*(\\d+)(?:\\s*(?:秒|s|S))?|(\\d+)\\s*(?:秒|s|S)"
+    )
+
+    /**
+     * 解析页面倒计时剩余秒数（取所有匹配中的最小值，即最接近结束的那个）。
+     * 解析不到（或没有正在进行的倒计时）返回 null。
+     */
+    fun remainingCountdownSeconds(nodes: List<AccessibilityNodeInfo>): Int? {
+        val pageText = buildString {
+            for (n in nodes) {
+                n.text?.toString()?.let { append(it).append(' ') }
+                n.contentDescription?.toString()?.let { append(it).append(' ') }
+            }
+        }
+        val compactText = pageText.replace(Regex("\\s+"), "")
+        var min: Int? = null
+        for (text in arrayOf(pageText, compactText)) {
+            for (m in COUNTDOWN_NUMBER_REGEX.findAll(text)) {
+                val v = m.groupValues[1].ifEmpty { m.groupValues[2] }.toIntOrNull() ?: continue
+                if (v > 0 && (min == null || v < min)) min = v
+            }
+        }
+        return min
+    }
+
     /** 点击类规则，按顺序匹配 */
     val CLICK_RULES = listOf(
         ClickRule(

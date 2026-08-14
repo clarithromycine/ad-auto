@@ -24,10 +24,30 @@ class AdDetector(private val service: AccessibilityService) {
         private val KNOWN_VIDEO_PACKAGES = setOf("com.phoenix.read")
         /** 窗口切换后延迟重扫的间隔 */
         private const val RETRY_DELAY_MS = 350L
+        /** 倒计时结束后重扫的缓冲：给“上滑继续观看”等文案留出渲染时间 */
+        private const val COUNTDOWN_BUFFER_MS = 300L
+        /** 超过该秒数的倒计时不精确等待（异常文案，避免长时间挂起） */
+        private const val MAX_COUNTDOWN_SECONDS = 30
     }
-    /** 窗口切换后延迟重扫的一次性任务（广告文案晚渲染时兜底） */
+
+    /** 延迟重扫 / 倒计时等待的调度器（主线程） */
     private val handler = Handler(Looper.getMainLooper())
     private var retryPending = false
+    /**
+     * 倒计时等待的截止时刻（uptimeMillis）：进入倒计时后，滑动会一直推迟到这个时刻才执行。
+     * 只在首次观测、或倒计时更早结束、或新一轮倒计时时更新，防止卡住的文案把等待无限拉长。
+     */
+    private var countdownDeadlineAt = 0L
+    /** 上次解析到的倒计时秒数：用于识别新一轮倒计时（值变大 = 广告重新开始） */
+    private var lastParsedSeconds = -1
+
+    /** 延迟重扫任务：到点后重新检测一次（广告文案晚渲染 / 倒计时结束时的兜底） */
+    private val retryRunnable = Runnable {
+        retryPending = false
+        if (SettingsManager.adSkipEnabled) {
+            detectAndAct(isWindowStateChange = false)
+        }
+    }
 
     /** 两次跳过动作之间的最小间隔，避免重复触发 */
     private val minActionInterval = 1500L
@@ -56,6 +76,9 @@ class AdDetector(private val service: AccessibilityService) {
         // 窗口切换时打印窗口结构，用于排查“穿山甲广告窗口”的可检测特征
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             logWindows()
+            // 新窗口 = 新上下文：重置倒计时等待状态，避免跨广告沿用旧的倒计时
+            countdownDeadlineAt = 0L
+            lastParsedSeconds = -1
         }
 
         // 内容变化事件非常频繁，做节流
@@ -109,6 +132,16 @@ class AdDetector(private val service: AccessibilityService) {
 
         val action = AdRules.match(nodes)
         if (action != null) {
+            // 页面有进行中的倒计时：滑动动作推迟到倒计时结束，精确控制滑动时机。
+            // 同时清除旧动作的冷却，避免倒计时结束瞬间被上一次动作（如穿山甲 6000ms）挡住而延迟几秒。
+            if (action.type == AdActionType.SWIPE_UP && withinCountdownWindow(nodes)) {
+                nextAllowedAt = 0
+                val remain = countdownDeadlineAt - SystemClock.uptimeMillis()
+                Log.i(TAG, "检测到倒计时，滑动推迟 ${remain}ms 后执行")
+                scheduleRetry(remain.coerceAtLeast(50L), "倒计时结束")
+                recycleAll(nodes)
+                return
+            }
             val now = SystemClock.uptimeMillis()
             if (now < nextAllowedAt) {
                 recycleAll(nodes)
@@ -128,7 +161,7 @@ class AdDetector(private val service: AccessibilityService) {
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
         } else {
             onResult("当前界面未检测到广告")
-            maybeScheduleRetry(fgPkg, isWindowStateChange)
+            maybeScheduleRetry(fgPkg, isWindowStateChange, nodes)
         }
         recycleAll(nodes)
     }
@@ -156,22 +189,61 @@ class AdDetector(private val service: AccessibilityService) {
     }
 
     /**
-     * 窗口切换后首次扫描未命中时，对已知短剧应用做一次延迟重扫：
-     * 广告文案（如“上滑继续观看”）常比窗口切换晚 1~2 帧才渲染进无障碍树，
-     * 立即扫描可能看不到，稍后重扫可显著降低漏检。只重扫一次，且由 nextAllowedAt 冷却兜底。
+     * 未命中广告时安排一次延迟重扫，时机优先由倒计时精确控制：
+     * - 有倒计时（如“5秒后可继续”）：等它到 0 再重扫（+小缓冲），把滑动时机精确控制在倒计时结束瞬间；
+     *   倒计时文案逐秒刷新，content change 事件会不断刷新这里的调度，保证始终跟踪最新剩余时间。
+     * - 无倒计时：保留原有兜底——窗口切换后 350ms 重扫一次（仅已知短剧应用，广告文案常晚 1~2 帧渲染）。
      */
-    private fun maybeScheduleRetry(fgPkg: String, isWindowStateChange: Boolean) {
+    private fun maybeScheduleRetry(
+        fgPkg: String,
+        isWindowStateChange: Boolean,
+        nodes: List<AccessibilityNodeInfo>,
+    ) {
+        if (withinCountdownWindow(nodes)) {
+            // 倒计时说明广告仍在展示：清除旧动作冷却，避免“倒计时结束瞬间”被上一次动作挡住而延迟几秒
+            nextAllowedAt = 0
+            val remain = countdownDeadlineAt - SystemClock.uptimeMillis()
+            Log.i(TAG, "检测到倒计时，${remain}ms 后重扫")
+            scheduleRetry(remain.coerceAtLeast(50L), "倒计时结束")
+            return
+        }
         if (!isWindowStateChange) return
-        if (retryPending) return
         if (fgPkg !in KNOWN_VIDEO_PACKAGES) return
-        retryPending = true
-        Log.d(TAG, "窗口切换未命中广告，${RETRY_DELAY_MS}ms 后重扫一次 ($fgPkg)")
-        handler.postDelayed({
-            retryPending = false
-            if (SettingsManager.adSkipEnabled) {
-                detectAndAct(isWindowStateChange = false)
+        scheduleRetry(RETRY_DELAY_MS, "窗口切换")
+    }
+
+    /**
+     * 更新倒计时等待状态，并判断当前是否应“等倒计时结束再动作”。
+     * 返回 true = 还在倒计时内（推迟动作）；false = 无倒计时 / 倒计时已到点（可以动手了）。
+     * 关键设计：
+     * - 一旦进入倒计时等待，即使某次快照没抓到倒计时文字，也保持等待到截止时刻，避免文案闪烁导致提前滑动；
+     * - 截止时刻只在“首次观测”或“更早结束”时提前，卡住的文案不会无限拉长等待；
+     * - 解析到更大的秒数（新一轮倒计时 / 广告重新开始）会更新截止时刻。
+     */
+    private fun withinCountdownWindow(nodes: List<AccessibilityNodeInfo>): Boolean {
+        val now = SystemClock.uptimeMillis()
+        val remaining = AdRules.remainingCountdownSeconds(nodes)
+        if (remaining != null && remaining in 1..MAX_COUNTDOWN_SECONDS) {
+            val deadline = now + remaining * 1000L + COUNTDOWN_BUFFER_MS
+            val isRestart = remaining > lastParsedSeconds // 比上次更长 = 新一轮倒计时
+            val isEarlier = countdownDeadlineAt != 0L && deadline < countdownDeadlineAt
+            if (countdownDeadlineAt == 0L || isRestart || isEarlier) {
+                countdownDeadlineAt = deadline
             }
-        }, RETRY_DELAY_MS)
+            lastParsedSeconds = remaining
+        }
+        if (countdownDeadlineAt != 0L && now < countdownDeadlineAt) return true
+        countdownDeadlineAt = 0L
+        lastParsedSeconds = -1
+        return false
+    }
+
+    /** 取消旧任务并重新安排一次延迟重扫（始终替换，保证跟踪最新剩余时间） */
+    private fun scheduleRetry(delay: Long, reason: String) {
+        handler.removeCallbacks(retryRunnable)
+        retryPending = true
+        Log.d(TAG, "延迟重扫：${delay}ms 后 ($reason)")
+        handler.postDelayed(retryRunnable, delay)
     }
 
     private fun perform(action: AdAction): Boolean {
