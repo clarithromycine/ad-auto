@@ -130,11 +130,13 @@ class AdDetector(private val service: AccessibilityService) {
             return
         }
 
-        val action = AdRules.match(nodes)
+        // 页面文本只拼接一次：关键字匹配与倒计时解析共用，避免重复遍历节点树导致主线程卡顿
+        val pageText = AdRules.pageTextOf(nodes)
+        val action = AdRules.match(nodes, pageText)
         if (action != null) {
             // 页面有进行中的倒计时：滑动动作推迟到倒计时结束，精确控制滑动时机。
             // 同时清除旧动作的冷却，避免倒计时结束瞬间被上一次动作（如穿山甲 6000ms）挡住而延迟几秒。
-            if (action.type == AdActionType.SWIPE_UP && withinCountdownWindow(nodes)) {
+            if (action.type == AdActionType.SWIPE_UP && withinCountdownWindow(pageText)) {
                 nextAllowedAt = 0
                 val remain = countdownDeadlineAt - SystemClock.uptimeMillis()
                 Log.i(TAG, "检测到倒计时，滑动推迟 ${remain}ms 后执行")
@@ -161,7 +163,7 @@ class AdDetector(private val service: AccessibilityService) {
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
         } else {
             onResult("当前界面未检测到广告")
-            maybeScheduleRetry(fgPkg, isWindowStateChange, nodes)
+            maybeScheduleRetry(fgPkg, isWindowStateChange, pageText)
         }
         recycleAll(nodes)
     }
@@ -197,9 +199,9 @@ class AdDetector(private val service: AccessibilityService) {
     private fun maybeScheduleRetry(
         fgPkg: String,
         isWindowStateChange: Boolean,
-        nodes: List<AccessibilityNodeInfo>,
+        pageText: String,
     ) {
-        if (withinCountdownWindow(nodes)) {
+        if (withinCountdownWindow(pageText)) {
             // 倒计时说明广告仍在展示：清除旧动作冷却，避免“倒计时结束瞬间”被上一次动作挡住而延迟几秒
             nextAllowedAt = 0
             val remain = countdownDeadlineAt - SystemClock.uptimeMillis()
@@ -220,9 +222,9 @@ class AdDetector(private val service: AccessibilityService) {
      * - 截止时刻只在“首次观测”或“更早结束”时提前，卡住的文案不会无限拉长等待；
      * - 解析到更大的秒数（新一轮倒计时 / 广告重新开始）会更新截止时刻。
      */
-    private fun withinCountdownWindow(nodes: List<AccessibilityNodeInfo>): Boolean {
+    private fun withinCountdownWindow(pageText: String): Boolean {
         val now = SystemClock.uptimeMillis()
-        val remaining = AdRules.remainingCountdownSeconds(nodes)
+        val remaining = AdRules.remainingCountdownSeconds(pageText)
         if (remaining != null && remaining in 1..MAX_COUNTDOWN_SECONDS) {
             val deadline = now + remaining * 1000L + COUNTDOWN_BUFFER_MS
             val isRestart = remaining > lastParsedSeconds // 比上次更长 = 新一轮倒计时
@@ -292,7 +294,10 @@ class AdDetector(private val service: AccessibilityService) {
         while (stack.isNotEmpty()) {
             val node = stack.removeLast()
             if (!node.isVisibleToUser) continue
-            out.add(node)
+            // 只保留带文字/内容描述的节点：匹配只用得到这些，可大幅减少节点数与主线程开销（拖动悬浮球更跟手）
+            if (!node.text.isNullOrEmpty() || !node.contentDescription.isNullOrEmpty()) {
+                out.add(node)
+            }
             for (i in 0 until node.childCount) {
                 stack.add(node.getChild(i) ?: continue)
             }

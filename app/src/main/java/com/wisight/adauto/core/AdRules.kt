@@ -71,17 +71,20 @@ object AdRules {
         "(?:广告|倒计时)\\s*(\\d+)(?:\\s*(?:秒|s|S))?|(\\d+)\\s*(?:秒|s|S)"
     )
 
+    /** 拼接页面文本（所有节点的 text + contentDescription），供匹配与倒计时解析共用 */
+    fun pageTextOf(nodes: List<AccessibilityNodeInfo>): String = buildString {
+        for (n in nodes) {
+            n.text?.toString()?.let { append(it).append(' ') }
+            n.contentDescription?.toString()?.let { append(it).append(' ') }
+        }
+    }
+
     /**
      * 解析页面倒计时剩余秒数（取所有匹配中的最小值，即最接近结束的那个）。
      * 解析不到（或没有正在进行的倒计时）返回 null。
+     * 传入已拼接好的页面文本，避免重复遍历节点树（主线程开销）。
      */
-    fun remainingCountdownSeconds(nodes: List<AccessibilityNodeInfo>): Int? {
-        val pageText = buildString {
-            for (n in nodes) {
-                n.text?.toString()?.let { append(it).append(' ') }
-                n.contentDescription?.toString()?.let { append(it).append(' ') }
-            }
-        }
+    fun remainingCountdownSeconds(pageText: String): Int? {
         val compactText = pageText.replace(Regex("\\s+"), "")
         var min: Int? = null
         for (text in arrayOf(pageText, compactText)) {
@@ -147,13 +150,7 @@ object AdRules {
      * 在页面节点集合中查找广告并决定执行的动作。
      * 返回 null 表示当前界面未检测到广告。
      */
-    fun match(nodes: List<AccessibilityNodeInfo>): AdAction? {
-        val pageText = buildString {
-            for (n in nodes) {
-                n.text?.toString()?.let { append(it).append(' ') }
-                n.contentDescription?.toString()?.let { append(it).append(' ') }
-            }
-        }
+    fun match(nodes: List<AccessibilityNodeInfo>, pageText: String): AdAction? {
         // 去掉空白后做匹配，兼容“上滑 继续看短剧”这类带空格写法
         val compactText = pageText.replace(Regex("\\s+"), "")
 
