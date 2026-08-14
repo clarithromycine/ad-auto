@@ -26,6 +26,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.wisight.adauto.MainActivity
 import com.wisight.adauto.R
+import com.wisight.adauto.core.AdDetector
 import com.wisight.adauto.core.SettingsManager
 import kotlin.math.abs
 
@@ -142,6 +143,7 @@ class FloatingBallService : Service() {
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
                     moved = false
+                    AdDetector.isDragging = false
                     Log.d(TAG, "touch down at ${event.rawX.toInt()},${event.rawY.toInt()}")
                     longPressHandler.postDelayed(
                         longPressRunnable,
@@ -155,6 +157,8 @@ class FloatingBallService : Service() {
                     if (!moved && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
                         moved = true
                         longPressHandler.removeCallbacks(longPressRunnable)
+                        // 真正开始拖动：暂停广告检测，保证拖动流畅
+                        AdDetector.isDragging = true
                     }
                     if (moved) {
                         params.x = (initialX + dx).toInt()
@@ -165,12 +169,18 @@ class FloatingBallService : Service() {
                 }
                 MotionEvent.ACTION_UP -> {
                     longPressHandler.removeCallbacks(longPressRunnable)
+                    if (moved) {
+                        // 拖动结束：恢复检测并补扫一次，避免拖动期间漏掉广告
+                        AdDetector.isDragging = false
+                        AdSkipAccessibilityService.instance?.scanOnce { }
+                    }
                     if (!moved && !longPressed) onBallTap()
                     true
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     longPressHandler.removeCallbacks(longPressRunnable)
                     longPressed = false
+                    AdDetector.isDragging = false
                     true
                 }
                 else -> false

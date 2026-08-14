@@ -16,7 +16,7 @@ import android.view.accessibility.AccessibilityWindowInfo
  */
 class AdDetector(private val service: AccessibilityService) {
 
-    private companion object {
+    companion object {
         const val TAG = "AdDetector"
         /** 本应用包名：设置页里含“自动跳过广告/广告快跳”等文字，绝不能当成广告去检测 */
         private const val SELF_PACKAGE = "com.wisight.adauto"
@@ -28,6 +28,13 @@ class AdDetector(private val service: AccessibilityService) {
         private const val COUNTDOWN_BUFFER_MS = 300L
         /** 超过该秒数的倒计时不精确等待（异常文案，避免长时间挂起） */
         private const val MAX_COUNTDOWN_SECONDS = 30
+
+        /**
+         * 悬浮球正在被拖动：拖动期间暂停广告检测，避免检测占用主线程导致拖动卡顿。
+         * 拖动结束后由悬浮球触发一次补扫。
+         */
+        @Volatile
+        var isDragging = false
     }
 
     /** 延迟重扫 / 倒计时等待的调度器（主线程） */
@@ -72,6 +79,8 @@ class AdDetector(private val service: AccessibilityService) {
         if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
+        // 拖动悬浮球期间不检测，避免占用主线程
+        if (isDragging) return
 
         // 窗口切换时打印窗口结构，用于排查“穿山甲广告窗口”的可检测特征
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
@@ -111,6 +120,8 @@ class AdDetector(private val service: AccessibilityService) {
     }
 
     private fun detectAndAct(onResult: (String) -> Unit = {}, isWindowStateChange: Boolean = false) {
+        // 拖动悬浮球期间暂停检测，保证拖动流畅；结束后由悬浮球补扫一次
+        if (isDragging) return
         // 前台应用包名：先排除我们自己（设置页里含“自动跳过/广告快跳”等文字，会被误判成广告）。
         // 例如在设置页打开开关会触发界面变化事件，若不排除就会点到自己界面上的“跳过”/“关闭”。
         val fgPkg = foregroundPackage()
