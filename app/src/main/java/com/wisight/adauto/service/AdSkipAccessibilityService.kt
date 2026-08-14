@@ -35,6 +35,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
+        // 下拉通知栏/控制中心时，触摸可能被系统（com.android.systemui）接管，导致悬浮球收不到
+        // UP/CANCEL，其 500ms 长按定时器会误触发而自动打开设置页。检测到系统界面窗口切换时，
+        // 主动取消悬浮球挂起的长按。
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.packageName?.toString() == "com.android.systemui"
+        ) {
+            FloatingBallService.instance?.cancelPendingLongPress()
+        }
         detector?.onAccessibilityEvent(event)
     }
 

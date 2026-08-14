@@ -18,8 +18,16 @@ class AdDetector(private val service: AccessibilityService) {
 
     companion object {
         const val TAG = "AdDetector"
-        /** 本应用包名：设置页里含“自动跳过广告/广告快跳”等文字，绝不能当成广告去检测 */
-        private const val SELF_PACKAGE = "com.wisight.adauto"
+        /**
+         * 永不当作广告去检测的包：本应用自身 + 系统界面。
+         * - 自身设置页/悬浮球含“自动跳过广告/广告快跳”等文字；
+         * - 系统界面（通知栏/控制中心）会显示我们的常驻通知“正在自动跳过广告”，
+         *   不排除会被误判成广告并点击，从而点开通知跳到设置页。
+         */
+        private val NON_AD_PACKAGES = setOf(
+            "com.wisight.adauto",
+            "com.android.systemui",
+        )
         /** 需要延迟重扫的已知短剧/视频应用：广告文案常比窗口切换晚 1~2 帧才渲染进无障碍树 */
         private val KNOWN_VIDEO_PACKAGES = setOf("com.phoenix.read")
         /** 窗口切换后延迟重扫的间隔 */
@@ -129,8 +137,8 @@ class AdDetector(private val service: AccessibilityService) {
             onResult("无障碍服务尚未就绪")
             return
         }
-        if (fgPkg == SELF_PACKAGE) {
-            onResult("当前界面是广告快跳自身，无需检测")
+        if (fgPkg in NON_AD_PACKAGES) {
+            onResult("当前界面是广告快跳自身或系统界面，无需检测")
             return
         }
 
@@ -335,6 +343,8 @@ class AdDetector(private val service: AccessibilityService) {
             ) continue
             val root = win.root ?: continue
             val pkg = root.packageName?.toString()
+            // 跳过系统界面/自身窗口：通知栏里会出现我们的通知文案，避免误判成广告点击
+            if (pkg in NON_AD_PACKAGES) continue
             if (!win.isActive && pkg != fgPkg) continue
             collectNodes(root, out)
         }

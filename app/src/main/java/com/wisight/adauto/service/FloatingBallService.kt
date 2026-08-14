@@ -42,6 +42,10 @@ class FloatingBallService : Service() {
         private const val CHANNEL_ID = "floating_ball"
         private const val TAG = "AdAutoBall"
 
+        @Volatile
+        var instance: FloatingBallService? = null
+            private set
+
         fun start(context: Context) {
             val intent = Intent(context, FloatingBallService::class.java)
             context.startForegroundService(intent)
@@ -73,6 +77,7 @@ class FloatingBallService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
         try {
@@ -90,6 +95,7 @@ class FloatingBallService : Service() {
 
     override fun onDestroy() {
         removeBall()
+        instance = null
         super.onDestroy()
     }
 
@@ -224,6 +230,19 @@ class FloatingBallService : Service() {
         }
         ballView = null
         layoutParams = null
+    }
+
+    /**
+     * 取消挂起的长按检测（下拉通知栏/控制中心接管触摸时由无障碍服务调用），
+     * 避免悬浮球被误判为“长按”而自动打开设置页；同时复位拖动暂停标志，
+     * 防止通知栏手势把 isDragging 卡在 true 导致后续不再检测。
+     */
+    fun cancelPendingLongPress() {
+        longPressHandler.removeCallbacks(longPressRunnable)
+        longPressed = false
+        moved = false
+        AdDetector.isDragging = false
+        Log.d(TAG, "cancel pending long-press (systemui takeover)")
     }
 
     private fun createNotificationChannel() {
