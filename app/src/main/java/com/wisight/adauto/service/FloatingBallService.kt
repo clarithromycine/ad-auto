@@ -160,11 +160,11 @@ class FloatingBallService : Service() {
                         // 真正开始拖动：暂停广告检测，保证拖动流畅
                         AdDetector.isDragging = true
                     }
-                    if (moved) {
-                        params.x = (initialX + dx).toInt()
-                        params.y = (initialY + dy).toInt()
-                        windowManager.updateViewLayout(view, params)
-                    }
+                    // 无论是否超过 slop 都跟随手指移动：避免刚按下拖动时有“死区”延迟
+                    // （slop 只用于区分“点击 vs 拖动”，不影响跟手）
+                    params.x = (initialX + dx).toInt()
+                    params.y = (initialY + dy).toInt()
+                    windowManager.updateViewLayout(view, params)
                     true
                 }
                 MotionEvent.ACTION_UP -> {

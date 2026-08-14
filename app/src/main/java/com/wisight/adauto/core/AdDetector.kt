@@ -303,6 +303,8 @@ class AdDetector(private val service: AccessibilityService) {
         val stack = ArrayDeque<AccessibilityNodeInfo>()
         stack.add(root)
         while (stack.isNotEmpty()) {
+            // 拖动悬浮球已开始：立即中止本次检测，把主线程让给拖动
+            if (isDragging) return
             val node = stack.removeLast()
             if (!node.isVisibleToUser) continue
             // 只保留带文字/内容描述的节点：匹配只用得到这些，可大幅减少节点数与主线程开销（拖动悬浮球更跟手）
