@@ -44,7 +44,7 @@
     <string name="ball_tap_hint">点击：快捷开关自动跳过 | 长按：打开设置</string>
     <string name="notif_channel_ball">悬浮球服务</string>
     <string name="notif_ball_title">广告快跳运行中</string>
-    <string name="notif_ball_text">悬浮球已就位，正在自动跳过广告</string>
+    <string name="notif_ball_text">悬浮球已就位，正在自动工作</string>
 
     <string name="btn_scan_now">立即检测当前界面</string>
     <string name="toast_no_ad">当前界面未检测到广告</string>

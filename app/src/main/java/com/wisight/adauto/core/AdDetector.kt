@@ -27,6 +27,7 @@ class AdDetector(private val service: AccessibilityService) {
         private val NON_AD_PACKAGES = setOf(
             "com.wisight.adauto",
             "com.android.systemui",
+            "miui.systemui.plugin",
         )
         /** 需要延迟重扫的已知短剧/视频应用：广告文案常比窗口切换晚 1~2 帧才渲染进无障碍树 */
         private val KNOWN_VIDEO_PACKAGES = setOf("com.phoenix.read")
