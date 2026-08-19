@@ -33,6 +33,8 @@ class MainActivity : AppCompatActivity() {
 
         setupListeners()
         binding.etCustomKeywords.setText(SettingsManager.customKeywords)
+        binding.etSupportedPackages.setText(SettingsManager.supportedPackages)
+        binding.switchGenericMode.isChecked = SettingsManager.genericModeEnabled
         requestNotificationPermissionIfNeeded()
     }
 
@@ -61,6 +63,8 @@ class MainActivity : AppCompatActivity() {
         }
         binding.btnSaveRules.setOnClickListener {
             SettingsManager.customKeywords = binding.etCustomKeywords.text?.toString()?.trim().orEmpty()
+            SettingsManager.supportedPackages = binding.etSupportedPackages.text?.toString()?.trim().orEmpty()
+            SettingsManager.genericModeEnabled = binding.switchGenericMode.isChecked
             Toast.makeText(this, R.string.toast_rule_saved, Toast.LENGTH_SHORT).show()
         }
         binding.btnScanNow.setOnClickListener {

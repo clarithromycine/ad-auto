@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Replicate AdRules.match() / AdDetector logic against a uiautomator dump
-to prove WHY a false positive happens (no execution, pure analysis).
+(package name in <hierarchy package="...">) to prove WHY a false positive
+happens (no execution, pure analysis).
+
+Includes the AdDetector scope gate added 2026-08-19: unless generic mode is
+on, AdAuto only acts inside the supported short-drama/video packages
+(default com.phoenix.read) -- see SettingsManager.supportedPackages.
 """
 import re, sys
 import xml.etree.ElementTree as ET
@@ -18,6 +23,25 @@ xml = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)', '&amp;', xml)
 end = xml.rfind('</hierarchy>')
 if end != -1:
     xml = xml[:end + len('</hierarchy>')]
+
+# ---------- AdDetector scope gate (2026-08-19) ----------
+GENERIC_MODE = False  # mirror SettingsManager.genericModeEnabled default
+SUPPORTED_PACKAGES = {"com.phoenix.read"}  # mirror SettingsManager.supportedPackagesList()
+root_el = ET.fromstring(xml)
+# uiautomator puts package on the first <node>, not on <hierarchy>
+def first_pkg(el):
+    p = el.get('package', '') or ''
+    if p:
+        return p
+    for c in el:
+        return first_pkg(c)
+    return ''
+dump_pkg = first_pkg(root_el)
+print('dump package:', dump_pkg or '(none)')
+if not GENERIC_MODE and dump_pkg not in SUPPORTED_PACKAGES:
+    print('>>> GATED: current App (%s) is not in supported packages -> AdAuto does NOT act here' % dump_pkg)
+    sys.exit(0)
+print('>>> in scope (generic mode OR supported package), continuing analysis')
 
 class Node:
     __slots__ = ('text', 'desc', 'cls', 'clickable', 'pkg', 'bounds', 'children')
@@ -135,28 +159,35 @@ def matches(n, kw):
     return kw in n.text or kw in n.desc
 
 print()
-print('=== CLICK_RULES simulation ===')
-matched_any = False
-for name, texts, req_ctx, req_cd in CLICK_RULES:
-    if req_ctx and not has_ad_context:
-        continue
-    if req_cd and not has_countdown:
-        continue
-    for n in nodes:
-        for kw in texts:
-            if kw and matches(n, kw):
-                clickable = find_clickable_parents(n)
-                if clickable is not None:
-                    print('>>> MATCH: rule=%r keyword=%r node_text=%r node_desc=%r' % (name, kw, n.text[:30], n.desc[:30]))
-                    print('    clickable target: text=%r desc=%r class=%s bounds=%s' % (clickable.text[:30], clickable.desc[:30], clickable.cls, clickable.bounds))
-                    matched_any = True
+print('=== FINAL DECISION (order: swipe-up > playback-protection > click rules) ===')
+if swipe_hits:
+    print('>>> ACTION: SWIPE_UP (上滑继续观看) — explicit swipe-up prompt, overrides playback protection')
+else:
+    if has_pc:
+        print('>>> ACTION: none — playback controls present (正剧保护)')
+    else:
+        print('>>> no swipe-up prompt and no playback protection -> checking click rules')
+        matched_any = False
+        for name, texts, req_ctx, req_cd in CLICK_RULES:
+            if req_ctx and not has_ad_context:
+                continue
+            if req_cd and not has_countdown:
+                continue
+            for n in nodes:
+                for kw in texts:
+                    if kw and matches(n, kw):
+                        clickable = find_clickable_parents(n)
+                        if clickable is not None:
+                            print('>>> MATCH: rule=%r keyword=%r node_text=%r node_desc=%r' % (name, kw, n.text[:30], n.desc[:30]))
+                            print('    clickable target: text=%r desc=%r class=%s bounds=%s' % (clickable.text[:30], clickable.desc[:30], clickable.cls, clickable.bounds))
+                            matched_any = True
+                        break
+                if matched_any:
+                    break
+            if matched_any:
                 break
-        if matched_any:
-            break
-    if matched_any:
-        break
-if not matched_any:
-    print('(current screen does NOT trigger any click rule)')
+        if not matched_any:
+            print('(current screen does NOT trigger any click rule)')
 
 print()
 print('=== nodes containing 继续 ===')

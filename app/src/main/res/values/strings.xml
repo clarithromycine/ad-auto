@@ -31,6 +31,10 @@
     <string name="rule_custom_title">自定义“跳过”按钮关键词</string>
     <string name="rule_custom_desc">用逗号分隔，出现这些文字的按钮会被自动点击（默认已包含：跳过、跳过广告、关闭广告、知道了）</string>
     <string name="rule_custom_hint">例如：跳转,继续观看,去看正片</string>
+    <string name="rule_scope_title">自动跳过范围</string>
+    <string name="rule_scope_desc">默认只在下方填写的短剧/视频 App 内自动检测广告，避免在聊天、设置、桌面等普通界面把页面上的“广告/关闭/跳过”等文字误判成广告而自动点击。</string>
+    <string name="rule_scope_only_label">仅检测下方 App（推荐）</string>
+    <string name="rule_scope_hint">App 包名，逗号分隔，例如：com.phoenix.read</string>
     <string name="btn_save">保存规则</string>
 
     <string name="toast_rule_saved">规则已保存</string>

@@ -29,8 +29,6 @@ class AdDetector(private val service: AccessibilityService) {
             "com.android.systemui",
             "miui.systemui.plugin",
         )
-        /** 需要延迟重扫的已知短剧/视频应用：广告文案常比窗口切换晚 1~2 帧才渲染进无障碍树 */
-        private val KNOWN_VIDEO_PACKAGES = setOf("com.phoenix.read")
         /** 窗口切换后延迟重扫的间隔 */
         private const val RETRY_DELAY_MS = 350L
         /** 倒计时结束后重扫的缓冲：给“上滑继续观看”等文案留出渲染时间 */
@@ -142,6 +140,12 @@ class AdDetector(private val service: AccessibilityService) {
             onResult("当前界面是广告快跳自身或系统界面，无需检测")
             return
         }
+        // 只在前台 App 属于“支持的包名”时才检测；通用模式下才对所有 App 检测（误触风险更高）。
+        // 避免在普通 App（聊天/设置/桌面等）里把页面上的“广告/关闭/跳过”等字样误判成广告而自动点击。
+        if (!SettingsManager.genericModeEnabled && fgPkg !in SettingsManager.supportedPackagesList()) {
+            onResult("当前 App（$fgPkg）不在自动跳过范围内")
+            return
+        }
 
         val nodes = ArrayList<AccessibilityNodeInfo>()
         collectFromAllWindows(nodes, fgPkg)
@@ -230,7 +234,9 @@ class AdDetector(private val service: AccessibilityService) {
             return
         }
         if (!isWindowStateChange) return
-        if (fgPkg !in KNOWN_VIDEO_PACKAGES) return
+        // 窗口切换延迟重扫只在支持的短剧/视频 App 内做（广告文案常晚 1~2 帧渲染）；
+        // 通用模式下其它 App 不做额外重扫，减少误触与主线程开销。
+        if (fgPkg !in SettingsManager.supportedPackagesList()) return
         scheduleRetry(RETRY_DELAY_MS, "窗口切换")
     }
 

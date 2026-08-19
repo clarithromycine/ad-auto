@@ -157,14 +157,10 @@ object AdRules {
         // 去掉空白后做匹配，兼容“上滑 继续看短剧”这类带空格写法
         val compactText = pageText.replace(Regex("\\s+"), "")
 
-        // 0) 正剧播放保护：出现播放器控件特征（第X集/倍速/选集/热评等）
-        //    说明当前是正常短剧播放，绝不执行滑动/点击，避免误伤正剧内容。
-        val hasPlaybackControls = PLAYBACK_CONTROL_KEYWORDS.any {
-            pageText.contains(it) || compactText.contains(it)
-        } || compactText.contains(EPISODE_REGEX)
-        if (hasPlaybackControls) return null
-
-        // 1) “上滑继续观看短剧”类广告 -> 上滑
+        // 1) “上滑继续观看短剧”类广告 -> 上滑。
+        //    这类提示词带明确方向（上滑），是硬性广告信号，正常播放时绝不会出现，
+        //    因此放在“正剧保护”之前判定——避免广告文案里偶然出现的“展开”等正剧词
+        //    把显式的上滑提示拦截掉（2026-08-17 红果房产视频广告误拦截“上滑继续观看短剧”）。
         if (SWIPE_UP_KEYWORDS.any { pageText.contains(it) || compactText.contains(it) }) {
             // 附带匹配到的节点，便于日志输出提示词精确坐标
             val matched = nodes.firstOrNull { n ->
@@ -174,6 +170,15 @@ object AdRules {
             }
             return AdAction(AdActionType.SWIPE_UP, matched, reason = "上滑继续观看")
         }
+
+        // 0) 正剧播放保护：出现播放器控件特征（第X集/倍速/选集/热评等）
+        //    说明当前是正常短剧播放，绝不执行滑动/点击，避免误伤正剧内容。
+        //    （显式上滑提示已在上面优先处理；此保护仅守护后面的“立即领取”启发式
+        //    与点击规则，防止正常播放时误伤）
+        val hasPlaybackControls = PLAYBACK_CONTROL_KEYWORDS.any {
+            pageText.contains(it) || compactText.contains(it)
+        } || compactText.contains(EPISODE_REGEX)
+        if (hasPlaybackControls) return null
 
         // 1.5) 穿山甲 SurfaceView 视频广告（红果短剧等）：
         // 广告提示词画在视频 Surface 上，无障碍树读不到任何文字（关键字匹配失效）。
