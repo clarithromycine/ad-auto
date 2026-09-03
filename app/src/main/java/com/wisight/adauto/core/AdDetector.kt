@@ -232,10 +232,20 @@ class AdDetector(private val service: AccessibilityService) {
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
         } else {
-            // 没有可直接点击/划走的按钮：
-            // 1) 页面仍有倒计时 = “需要倒计时等待”的广告 → 进入“点中心暂停”流程；
-            // 2) 已处于暂停流程中（等底部“上滑继续观看”提示渲染）→ 保持短周期重扫（原逻辑）。
-            if (countdownFound || pauseState != PauseState.NONE) {
+            // 没有可直接点击/划走的按钮，需要区分两类情况：
+            // A) 正剧播放中的前置提示“X秒后进入广告/即将播放广告” —— 广告还没开始、
+            //    正剧仍在播放。此时绝不能点中心暂停（会把正剧暂停），只能照常等倒计时；
+            // B) 真正的广告页（倒计时等待型）→ 进入“点中心暂停”流程。
+            val upcomingAd = AdRules.hasUpcomingAd(pageText)
+            val inPlayback = AdRules.hasPlaybackControls(pageText)
+            // 暂停流程进行中若发现已回到正剧 / “即将进入广告”前置界面，说明不是可暂停的广告，
+            // 退出暂停流程，避免误暂停正剧后一直挂在等待里。
+            if (pauseState != PauseState.NONE && (inPlayback || upcomingAd)) {
+                Log.i(TAG, "已回到正剧/“即将进入广告”前置界面，退出暂停流程")
+                pauseState = PauseState.NONE
+            }
+            // 只在真正的广告页（非前置提示、非正剧播放）里尝试“点中心暂停”
+            if ((countdownFound && !upcomingAd && !inPlayback) || pauseState != PauseState.NONE) {
                 if (enterPauseBeforeSwipe(fgPkg)) {
                     onResult("检测到广告上下文，正在暂停视频以直接跳过")
                     recycleAll(nodes)

@@ -112,6 +112,36 @@ object AdRules {
         } || hasCountdown(pageText)
     }
 
+    /**
+     * “即将进入广告”的前置提示关键词：广告还没开始，正剧仍在播放。
+     * 例：“5秒后进入广告”、“即将播放广告”、“3秒后播放广告”。
+     * 这类文案会同时带倒计时数字（会被 hasCountdown 命中），但此时**不能**点中心暂停——
+     * 暂停会把正在播放的正剧停掉。
+     */
+    private val UPCOMING_AD_KEYWORDS = listOf(
+        "进入广告", "播放广告", "广告即将", "即将播放广告", "即将进入广告",
+        "后进入广告", "后播放广告", "开始播放广告", "即将开始播放", "即将开始广告",
+    )
+
+    /** 页面是否为“即将进入广告”的前置提示（广告尚未开始，正剧仍在播放）。 */
+    fun hasUpcomingAd(pageText: String): Boolean {
+        val compactText = pageText.replace(Regex("\\s+"), "")
+        return UPCOMING_AD_KEYWORDS.any {
+            pageText.contains(it) || compactText.contains(it)
+        }
+    }
+
+    /**
+     * 正剧播放保护：页面是否出现正常短剧播放器特征（倍速/选集/第X集/弹幕等）。
+     * 出现这些控件说明当前是正剧而非广告，任何滑动/点击（含点中心暂停）都不应执行。
+     */
+    fun hasPlaybackControls(pageText: String): Boolean {
+        val compactText = pageText.replace(Regex("\\s+"), "")
+        return PLAYBACK_CONTROL_KEYWORDS.any {
+            pageText.contains(it) || compactText.contains(it)
+        } || compactText.contains(EPISODE_REGEX)
+    }
+
     /** 点击类规则，按顺序匹配 */
     val CLICK_RULES = listOf(
         ClickRule(
@@ -191,10 +221,7 @@ object AdRules {
         //    说明当前是正常短剧播放，绝不执行滑动/点击，避免误伤正剧内容。
         //    （显式上滑提示已在上面优先处理；此保护仅守护后面的“立即领取”启发式
         //    与点击规则，防止正常播放时误伤）
-        val hasPlaybackControls = PLAYBACK_CONTROL_KEYWORDS.any {
-            pageText.contains(it) || compactText.contains(it)
-        } || compactText.contains(EPISODE_REGEX)
-        if (hasPlaybackControls) return null
+        if (hasPlaybackControls(pageText)) return null
 
         // 1.5) 穿山甲 SurfaceView 视频广告（红果短剧等）：
         // 广告提示词画在视频 Surface 上，无障碍树读不到任何文字（关键字匹配失效）。
