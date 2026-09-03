@@ -3,6 +3,7 @@ package com.wisight.adauto.core
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -35,6 +36,14 @@ class AdDetector(private val service: AccessibilityService) {
         private const val COUNTDOWN_BUFFER_MS = 300L
         /** 超过该秒数的倒计时不精确等待（异常文案，避免长时间挂起） */
         private const val MAX_COUNTDOWN_SECONDS = 30
+        /** 点中心暂停后，等待“中间播放按钮出现”的确认超时（毫秒） */
+        private const val PAUSE_CONFIRM_TIMEOUT_MS = 4_000L
+        /** 已确认暂停后，等待底部“上滑”提示出现的最长时间（毫秒），超时则回退原逻辑 */
+        private const val PAUSED_PROMPT_TIMEOUT_MS = 6_000L
+        /** 一次暂停流程失败后，本广告内不再尝试点暂停的冷却时长（毫秒） */
+        private const val PAUSE_FLOW_DISABLED_MS = 20_000L
+        /** 暂停流程中各阶段的重扫间隔（毫秒） */
+        private const val PAUSE_RESCAN_MS = 300L
 
         /**
          * 悬浮球正在被拖动：拖动期间暂停广告检测，避免检测占用主线程导致拖动卡顿。
@@ -54,6 +63,22 @@ class AdDetector(private val service: AccessibilityService) {
     private var countdownDeadlineAt = 0L
     /** 上次解析到的倒计时秒数：用于识别新一轮倒计时（值变大 = 广告重新开始） */
     private var lastParsedSeconds = -1
+
+    /**
+     * 广告“点中心暂停”流程状态：
+     * - NONE：正常 / 未进入；
+     * - WAIT_PAUSE：已点击屏幕中间，等待中间播放按钮出现（确认已暂停）；
+     * - PAUSED：已确认暂停（检测到播放按钮），等待底部“上滑继续观看”提示出现后按原逻辑划走。
+     */
+    private enum class PauseState { NONE, WAIT_PAUSE, PAUSED }
+
+    private var pauseState = PauseState.NONE
+    /** 点击屏幕中间的时刻（用于判断暂停确认是否超时） */
+    private var pauseTappedAt = 0L
+    /** 确认暂停的时刻（用于限制“已暂停但提示未出现”的等待时间） */
+    private var pauseConfirmedAt = 0L
+    /** 暂停流程失败后的禁用截止时刻：本广告内不再反复点中心，回退原倒计时逻辑 */
+    private var pauseFlowDisabledUntil = 0L
 
     /** 延迟重扫任务：到点后重新检测一次（广告文案晚渲染 / 倒计时结束时的兜底） */
     private val retryRunnable = Runnable {
@@ -92,9 +117,13 @@ class AdDetector(private val service: AccessibilityService) {
         // 窗口切换时打印窗口结构，用于排查“穿山甲广告窗口”的可检测特征
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             logWindows()
-            // 新窗口 = 新上下文：重置倒计时等待状态，避免跨广告沿用旧的倒计时
+            // 新窗口 = 新上下文：重置倒计时等待/暂停流程状态，避免跨广告沿用旧状态
             countdownDeadlineAt = 0L
             lastParsedSeconds = -1
+            pauseState = PauseState.NONE
+            pauseTappedAt = 0L
+            pauseConfirmedAt = 0L
+            pauseFlowDisabledUntil = 0L
         }
 
         // 内容变化事件非常频繁，做节流
@@ -156,17 +185,34 @@ class AdDetector(private val service: AccessibilityService) {
 
         // 页面文本只拼接一次：关键字匹配与倒计时解析共用，避免重复遍历节点树导致主线程卡顿
         val pageText = AdRules.pageTextOf(nodes)
+        val countdownFound = AdRules.hasCountdown(pageText)
         val action = AdRules.match(nodes, pageText)
         if (action != null) {
-            // 页面有进行中的倒计时：滑动动作推迟到倒计时结束，精确控制滑动时机。
-            // 同时清除旧动作的冷却，避免倒计时结束瞬间被上一次动作（如穿山甲 6000ms）挡住而延迟几秒。
-            if (action.type == AdActionType.SWIPE_UP && withinCountdownWindow(pageText)) {
+            // 已通过“点中心暂停”确认暂停的广告：滑动锁定已解除，即使底部仍有倒计时文案
+            // 也直接划走（暂停后“上滑”提示即满足条件）。
+            val pausedAndSwipe = pauseState == PauseState.PAUSED && action.type == AdActionType.SWIPE_UP
+            // 命中“上滑”但被倒计时锁住 = “需要倒计时等待”的广告：
+            // 新版策略是点击屏幕中间暂停视频（暂停后出现播放按钮），暂停即可直接划走，
+            // 不必被动等倒计时走完。暂停流程若超时/不适用，则回退到原来的“等倒计时结束再滑”。
+            if (!pausedAndSwipe && action.type == AdActionType.SWIPE_UP && withinCountdownWindow(pageText)) {
+                if (enterPauseBeforeSwipe(fgPkg)) {
+                    onResult("检测到需倒计时的广告，正在点中心暂停后直接划走")
+                    recycleAll(nodes)
+                    return
+                }
+                // 暂停流程不可用：按原逻辑等倒计时结束再滑动。
+                // 同时清除旧动作的冷却，避免倒计时结束瞬间被上一次动作（如穿山甲 6000ms）挡住而延迟几秒。
                 nextAllowedAt = 0
                 val remain = countdownDeadlineAt - SystemClock.uptimeMillis()
                 Log.i(TAG, "检测到倒计时，滑动推迟 ${remain}ms 后执行")
                 scheduleRetry(remain.coerceAtLeast(50L), "倒计时结束")
                 recycleAll(nodes)
                 return
+            }
+            if (pauseState != PauseState.NONE) {
+                // 已有可执行动作（能划走/能点），退出暂停等待流程
+                Log.i(TAG, "暂停流程结束，执行动作 ${action.type} (${action.reason})")
+                pauseState = PauseState.NONE
             }
             val now = SystemClock.uptimeMillis()
             if (now < nextAllowedAt) {
@@ -186,6 +232,16 @@ class AdDetector(private val service: AccessibilityService) {
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
         } else {
+            // 没有可直接点击/划走的按钮：
+            // 1) 页面仍有倒计时 = “需要倒计时等待”的广告 → 进入“点中心暂停”流程；
+            // 2) 已处于暂停流程中（等底部“上滑继续观看”提示渲染）→ 保持短周期重扫（原逻辑）。
+            if (countdownFound || pauseState != PauseState.NONE) {
+                if (enterPauseBeforeSwipe(fgPkg)) {
+                    onResult("检测到广告上下文，正在暂停视频以直接跳过")
+                    recycleAll(nodes)
+                    return
+                }
+            }
             onResult("当前界面未检测到广告")
             maybeScheduleRetry(fgPkg, isWindowStateChange, pageText)
         }
@@ -272,6 +328,166 @@ class AdDetector(private val service: AccessibilityService) {
         retryPending = true
         Log.d(TAG, "延迟重扫：${delay}ms 后 ($reason)")
         handler.postDelayed(retryRunnable, delay)
+    }
+
+    /**
+     * “需要倒计时等待”的广告：通过“点击屏幕中间让视频暂停”立即解锁滑动。
+     *
+     * 策略：遇到需倒计时等待的广告，先点一下屏幕中间暂停视频（暂停状态下中间会出现
+     * 播放按钮，用它判定“已暂停”）；暂停后底部“上滑继续观看短剧”提示立即变为可滑动，
+     * 后续仍走原逻辑——检测到提示满足后自动上滑划走，无需被动等倒计时走完。
+     *
+     * @return true=已接管调度（已点暂停/正在等待确认/已暂停等待提示）；
+     *         false=确认超时/不适用，调用方应回退到原“倒计时等待”逻辑。
+     */
+    private fun enterPauseBeforeSwipe(fgPkg: String): Boolean {
+        val now = SystemClock.uptimeMillis()
+        when (pauseState) {
+            PauseState.NONE -> {
+                // 本广告的暂停流程已失败过：不再反复点中心，直接回退原倒计时逻辑
+                if (now < pauseFlowDisabledUntil) return false
+                if (hasCenterPlayButton(fgPkg)) {
+                    Log.i(TAG, "广告已处于暂停态（中间出现播放按钮），等待下方上滑提示")
+                    pauseState = PauseState.PAUSED
+                    pauseConfirmedAt = now
+                } else {
+                    Log.i(TAG, "倒计时广告：点击屏幕中间暂停视频")
+                    tapCenter()
+                    pauseState = PauseState.WAIT_PAUSE
+                    pauseTappedAt = now
+                }
+                scheduleRetry(PAUSE_RESCAN_MS, "暂停确认/等待")
+                return true
+            }
+            PauseState.WAIT_PAUSE -> {
+                if (hasCenterPlayButton(fgPkg)) {
+                    Log.i(TAG, "已确认暂停（检测到中间播放按钮），等待下方上滑提示出现")
+                    pauseState = PauseState.PAUSED
+                    pauseConfirmedAt = now
+                    scheduleRetry(PAUSE_RESCAN_MS, "已暂停等待提示")
+                } else if (now - pauseTappedAt < PAUSE_CONFIRM_TIMEOUT_MS) {
+                    scheduleRetry(PAUSE_RESCAN_MS, "等待播放按钮出现")
+                } else {
+                    Log.w(TAG, "暂停确认超时，本广告回退倒计时等待逻辑")
+                    pauseState = PauseState.NONE
+                    pauseFlowDisabledUntil = now + PAUSE_FLOW_DISABLED_MS
+                    return false
+                }
+                return true
+            }
+            PauseState.PAUSED -> {
+                // 已暂停：短周期重扫，直到底部“上滑继续观看”提示渲染出来（由 action 分支划走）。
+                // 若提示长时间未出现，说明该广告暂停并不能解锁滑动，回退原倒计时逻辑。
+                if (now - pauseConfirmedAt < PAUSED_PROMPT_TIMEOUT_MS) {
+                    scheduleRetry(PAUSE_RESCAN_MS, "等待上滑提示")
+                    return true
+                }
+                Log.w(TAG, "已暂停但长时间未出现上滑提示，本广告回退倒计时等待逻辑")
+                pauseState = PauseState.NONE
+                pauseConfirmedAt = 0L
+                pauseFlowDisabledUntil = now + PAUSE_FLOW_DISABLED_MS
+                return false
+            }
+        }
+    }
+
+    /** 点击屏幕正中央（用于暂停倒计时广告的视频） */
+    private fun tapCenter(): Boolean {
+        val dm = service.resources.displayMetrics
+        val cx = dm.widthPixels * 0.5f
+        val cy = dm.heightPixels * 0.5f
+        val path = Path().apply { moveTo(cx, cy) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 60)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        Log.i(TAG, "tapCenter($cx,$cy)")
+        return service.dispatchGesture(gesture, null, null)
+    }
+
+    /**
+     * 检测屏幕中央是否出现“播放按钮”（视频已暂停的标志）。
+     * 倒计时广告点击屏幕暂停后，视频层中央会出现一个居中的播放图标
+     * （多为无文字的 ImageView），用它判定“视频已暂停”。
+     * 返回 true 表示中央区域存在播放按钮。
+     */
+    private fun hasCenterPlayButton(fgPkg: String): Boolean {
+        val dm = service.resources.displayMetrics
+        val cx = dm.widthPixels / 2f
+        val cy = dm.heightPixels / 2f
+        // 播放按钮精确居中，允许的中央区域（观察值约为屏宽 15~20% 的方块）
+        val halfW = dm.widthPixels * 0.24f
+        val halfH = dm.heightPixels * 0.14f
+        val minSize = dm.widthPixels * 0.06f
+        val maxSize = dm.widthPixels * 0.5f
+        val visited = ArrayList<AccessibilityNodeInfo>()
+        try {
+            val windows = try {
+                service.windows
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            var found = false
+
+            fun scan(root: AccessibilityNodeInfo) {
+                val stack = ArrayDeque<AccessibilityNodeInfo>()
+                stack.add(root)
+                while (stack.isNotEmpty() && !found) {
+                    if (isDragging) return
+                    val node = stack.removeLast()
+                    visited.add(node)
+                    if (!node.isVisibleToUser) continue
+                    val cls = node.className?.toString().orEmpty()
+                    val text = node.text?.toString().orEmpty()
+                    val desc = node.contentDescription?.toString().orEmpty()
+                    val isPlayText = text.contains("播放") || desc.contains("播放") ||
+                        text.contains("play", ignoreCase = true) || desc.contains("play", ignoreCase = true)
+                    // 候选：无文字的居中图片节点（播放按钮），或文字/描述含“播放”的节点
+                    val isImageCandidate = cls.contains("Image") && text.isEmpty() && desc.isEmpty()
+                    if (isImageCandidate || isPlayText) {
+                        val r = Rect()
+                        node.getBoundsInScreen(r)
+                        if (!r.isEmpty) {
+                            val w = r.width().toFloat()
+                            val h = r.height().toFloat()
+                            if (w >= minSize && w <= maxSize && h >= minSize && h <= maxSize) {
+                                val nx = (r.left + r.right) / 2f
+                                val ny = (r.top + r.bottom) / 2f
+                                if (kotlin.math.abs(nx - cx) <= halfW &&
+                                    kotlin.math.abs(ny - cy) <= halfH
+                                ) {
+                                    Log.i(TAG, "hasCenterPlayButton: $cls [${r.left},${r.top}][${r.right},${r.bottom}]")
+                                    found = true
+                                }
+                            }
+                        }
+                    }
+                    for (i in 0 until node.childCount) {
+                        stack.add(node.getChild(i) ?: continue)
+                    }
+                }
+            }
+
+            for (win in windows) {
+                if (found) break
+                if (win.type != AccessibilityWindowInfo.TYPE_APPLICATION &&
+                    win.type != AccessibilityWindowInfo.TYPE_SYSTEM
+                ) continue
+                val root = win.root ?: continue
+                val pkg = root.packageName?.toString()
+                if (pkg in NON_AD_PACKAGES) continue
+                if (!win.isActive && pkg != fgPkg) continue
+                scan(root)
+            }
+            // 兜底：windows 列表为空时退回活动窗口
+            if (!found) {
+                service.rootInActiveWindow?.let { scan(it) }
+            }
+            return found
+        } catch (t: Throwable) {
+            Log.w(TAG, "hasCenterPlayButton failed: $t")
+            return false
+        } finally {
+            recycleAll(visited)
+        }
     }
 
     private fun perform(action: AdAction): Boolean {

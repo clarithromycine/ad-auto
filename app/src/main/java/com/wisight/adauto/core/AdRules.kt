@@ -96,6 +96,22 @@ object AdRules {
         return min
     }
 
+    /** 页面是否出现广告倒计时文案（如 “5秒后可继续”、“3s”、“倒计时”）。 */
+    fun hasCountdown(pageText: String): Boolean {
+        val compactText = pageText.replace(Regex("\\s+"), "")
+        return COUNTDOWN_KEYWORDS.any {
+            pageText.contains(it, ignoreCase = true) || compactText.contains(it, ignoreCase = true)
+        } || pageText.contains(COUNTDOWN_REGEX) || compactText.contains(COUNTDOWN_REGEX)
+    }
+
+    /** 页面是否出现广告上下文（“广告”字样，或广告倒计时）。 */
+    fun hasAdContext(pageText: String): Boolean {
+        val compactText = pageText.replace(Regex("\\s+"), "")
+        return AD_CONTEXT_KEYWORDS.any {
+            pageText.contains(it, ignoreCase = true) || compactText.contains(it, ignoreCase = true)
+        } || hasCountdown(pageText)
+    }
+
     /** 点击类规则，按顺序匹配 */
     val CLICK_RULES = listOf(
         ClickRule(
@@ -195,17 +211,13 @@ object AdRules {
         }
 
         // 广告上下文：出现“广告”字样，或倒计时（如 “5秒后可继续”、“3s”)
-        val hasCountdown = COUNTDOWN_KEYWORDS.any {
-            pageText.contains(it, ignoreCase = true) || compactText.contains(it, ignoreCase = true)
-        } || pageText.contains(COUNTDOWN_REGEX) || compactText.contains(COUNTDOWN_REGEX)
-        val hasAdContext = AD_CONTEXT_KEYWORDS.any {
-            pageText.contains(it, ignoreCase = true) || compactText.contains(it, ignoreCase = true)
-        } || hasCountdown
+        val countdownFound = hasCountdown(pageText)
+        val adContextFound = hasAdContext(pageText)
 
         // 2) 内置点击规则
         for (rule in CLICK_RULES) {
-            if (rule.requireAdContext && !hasAdContext) continue
-            if (rule.requireCountdown && !hasCountdown) continue
+            if (rule.requireAdContext && !adContextFound) continue
+            if (rule.requireCountdown && !countdownFound) continue
             for (node in nodes) {
                 if (!node.matchesAny(rule.texts)) continue
                 val clickable = findClickable(node) ?: continue
@@ -215,7 +227,7 @@ object AdRules {
 
         // 3) 用户自定义关键词
         val custom = customClickTexts()
-        if (custom.isNotEmpty() && hasAdContext) {
+        if (custom.isNotEmpty() && adContextFound) {
             for (node in nodes) {
                 if (!node.matchesAny(custom)) continue
                 val clickable = findClickable(node) ?: continue
