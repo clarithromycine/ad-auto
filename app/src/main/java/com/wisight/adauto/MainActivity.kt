@@ -56,10 +56,14 @@ class MainActivity : AppCompatActivity() {
         binding.switchSkip.setOnCheckedChangeListener { _, checked ->
             SettingsManager.adSkipEnabled = checked
             binding.switchSkip.isChecked = checked
+            // 两个开关都关闭时才真正停掉服务（悬浮球“隐藏”时服务要继续留着，见下）
+            if (!checked && !SettingsManager.ballEnabled) FloatingBallService.stop(this)
         }
         binding.switchBall.setOnCheckedChangeListener { _, checked ->
             SettingsManager.ballEnabled = checked
-            if (checked) startBall() else FloatingBallService.stop(this)
+            // “关闭悬浮球”不是移除窗口，而是把球体变成完全透明（见 FloatingBallService.updateBallStyle）：
+            // 窗口保留 → 前台服务不必停 → App 不会被 MIUI/HyperOS 在后台挂起（否则就不会跳广告了）。
+            if (checked) startBall() else FloatingBallService.start(this)
         }
         binding.btnSaveRules.setOnClickListener {
             SettingsManager.customKeywords = binding.etCustomKeywords.text?.toString()?.trim().orEmpty()

@@ -89,7 +89,8 @@ class FloatingBallService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (ballView == null) showBall()
+        // 设置页改了“显示悬浮球/自动跳过”后再次进来：刷新球体外观（可见 / 透明）
+        updateBallStyle()
         return START_STICKY
     }
 
@@ -205,13 +206,35 @@ class FloatingBallService : Service() {
         ).show()
     }
 
+    /**
+     * 按当前设置刷新球体外观。
+     *
+     * “隐藏悬浮球”**不是移除窗口，而是把球体变成完全透明**（alpha=0，且不接收触摸）：
+     * 窗口仍然挂在 WindowManager 上 → 前台服务不用停 → App 不会被系统在后台挂起。
+     * 实测（MIUI/HyperOS）：真把服务停掉后，App 切到后台约 20 秒就收不到无障碍事件，
+     * 广告就不会被跳过；而那神“假活”用 dumpsys 看不出来（进程在、无障碍仍显示已绑定）。
+     */
     private fun updateBallStyle() {
         val view = ballView ?: return
-        val enabled = SettingsManager.adSkipEnabled
-        view.background = ContextCompat.getDrawable(
-            this,
-            if (enabled) R.drawable.bg_ball else R.drawable.bg_ball_disabled,
-        )
+        val params = layoutParams ?: return
+        if (SettingsManager.ballEnabled) {
+            // 显示：恢复正常不透明度与背景，并恢复可触摸
+            view.alpha = 1f
+            view.background = ContextCompat.getDrawable(
+                this,
+                if (SettingsManager.adSkipEnabled) R.drawable.bg_ball else R.drawable.bg_ball_disabled,
+            )
+            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        } else {
+            // 隐藏：完全透明（等同“一张透明图片”），并且不能拦截触摸，
+            // 否则左上角那片区域会点不动、也拖不了
+            view.alpha = 0f
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+        try {
+            windowManager.updateViewLayout(view, params)
+        } catch (_: Throwable) {
+        }
     }
 
     private fun openMainActivity() {
