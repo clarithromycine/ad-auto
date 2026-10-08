@@ -44,16 +44,27 @@ class AdDetector(private val service: AccessibilityService) {
         private const val PAUSE_FLOW_DISABLED_MS = 20_000L
         /** 暂停流程中各阶段的重扫间隔（毫秒） */
         private const val PAUSE_RESCAN_MS = 300L
-        /** 广告上滑后的补扫间隔（毫秒）：给划动动画/内容切换留出时间 */
-        private const val AD_SWIPE_RETRY_DELAY_MS = 900L
-        /** “同一串广告”判定窗口：距上次上滑在该窗口内，说明是同一条广告没划走或紧接着又是同形态广告 */
-        private const val AD_SWIPE_CHAIN_WINDOW_MS = 2_000L
-        /** 两次上滑之间的最短间隔：避免在广告入场动画期间连划，导致每次都打在动画上不生效 */
+        /**
+         * 广告上滑补扫的两段节奏（毫秒）：
+         * - **入场期**（前 [AD_SWIPE_FAST_ATTEMPTS] 次）：用最短间隔快速补扫，
+         *   覆盖“上滑落在入场动画上没生效”的窗口；
+         * - **看门狗期**（之后）：广告仍在屏但划不走——典型是“5s后可继续上滑观看”这类
+         *   **滑动锁**（锁期内滑动一律无效，实测横屏广告锁期约 12s），改用较慢节奏一直重试，
+         *   直到总预算/硬上限用尽。
+         *
+         * 为什么需要看门狗（2026-10-08 实测）：旧实现快速补扫 7 次（≈5s）就把预算烧光，
+         * 然后掉进穿山甲 6000ms 冷却，白等到 12s 才划走 —— 用户感知就是
+         * “明明锁早解除了、还要再等几秒”。
+         */
         private const val AD_SWIPE_MIN_RETRY_GAP_MS = 700L
-        /** 一串广告里最多连续上滑次数：超过则转正常冷却，避免广告异常时无限连划 */
-        private const val AD_SWIPE_MAX_ATTEMPTS = 6
+        private const val AD_SWIPE_FAST_ATTEMPTS = 7
+        private const val AD_SWIPE_WATCHDOG_GAP_MS = 1_500L
+        /** 一串广告的总补扫预算：超过就不再补扫，回到正常冷却（毫秒） */
+        private const val AD_SWIPE_TOTAL_BUDGET_MS = 40_000L
+        /** 一串广告里连续上滑的硬上限：兜底防病态循环 */
+        private const val AD_SWIPE_MAX_ATTEMPTS = 30
         /** 距上次广告上滑超过该时长视为整串结束，重新计数（毫秒） */
-        private const val AD_SWIPE_STREAK_RESET_MS = 5_000L
+        private const val AD_SWIPE_STREAK_RESET_MS = 10_000L
 
         /**
          * 悬浮球正在被拖动：拖动期间暂停广告检测，避免检测占用主线程导致拖动卡顿。
@@ -117,6 +128,16 @@ class AdDetector(private val service: AccessibilityService) {
     private var adSwipeStreak = 0
     /** 上一次广告上滑的时刻：间隔过久视为新一轮广告，重新计数 */
     private var lastAdSwipeAt = 0L
+    /** 当前“广告上滑链”的起始时刻：用于总预算判定（0 = 无进行中的链） */
+    private var adSwipeChainStartedAt = 0L
+    /** “冷却中”提示/补扫的节流时刻：content change 每秒可来十几次，不节流会刷爆日志 */
+    private var lastCooldownNoticeAt = 0L
+
+    /** 结束当前“广告上滑链”（窗口切换 / 锁期等待 / 换广告时调用） */
+    private fun resetAdSwipeChain() {
+        adSwipeStreak = 0
+        adSwipeChainStartedAt = 0L
+    }
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (!SettingsManager.adSkipEnabled) {
@@ -142,7 +163,7 @@ class AdDetector(private val service: AccessibilityService) {
             pauseTappedAt = 0L
             pauseConfirmedAt = 0L
             pauseFlowDisabledUntil = 0L
-            adSwipeStreak = 0
+            resetAdSwipeChain()
         }
 
         // 内容变化事件非常频繁，做节流
@@ -234,7 +255,13 @@ class AdDetector(private val service: AccessibilityService) {
             // 新版策略是点击屏幕中间暂停视频（暂停后出现播放按钮），暂停即可直接划走，
             // 不必被动等倒计时走完。暂停流程若超时/不适用，则回退到原来的“等倒计时结束再滑”。
             if (!pausedAndSwipe && action.type == AdActionType.SWIPE_UP && withinCountdownWindow(pageText)) {
-                if (enterPauseBeforeSwipe(fgPkg)) {
+                // 倒计时/滑动锁（如“5s后可继续上滑观看”）期间不划：
+                // 结束当前上滑链 + 清掉旧冷却，保证锁一解除就能用“全新预算”立即划走。
+                resetAdSwipeChain()
+                nextAllowedAt = 0
+                // 显式“滑动锁”（如“5s后可继续上滑观看”）期间不点中心暂停：
+                // 这种锁按时间解锁，暂停视频并不能解锁，反而在横屏全屏广告上有误触风险。
+                if (!AdRules.hasSwipeLock(pageText) && enterPauseBeforeSwipe(fgPkg)) {
                     onResult("检测到需倒计时的广告，正在点中心暂停后直接划走")
                     recycleAll(nodes)
                     return
@@ -262,21 +289,32 @@ class AdDetector(private val service: AccessibilityService) {
             val now = SystemClock.uptimeMillis()
             val sinceLastAdSwipe = now - lastAdSwipeAt
             // 距上次广告上滑已过很久 → 上一串广告结束，重新计数
-            if (isAdSwipe && sinceLastAdSwipe > AD_SWIPE_STREAK_RESET_MS) adSwipeStreak = 0
+            if (isAdSwipe && sinceLastAdSwipe > AD_SWIPE_STREAK_RESET_MS) resetAdSwipeChain()
+            val chainElapsed = if (adSwipeChainStartedAt == 0L) 0L else now - adSwipeChainStartedAt
+            // 入场期用最短间隔快速补扫；之后转入看门狗慢节奏（锁期很长，快划无意义且浪费事件）
+            val chainGap = if (adSwipeStreak < AD_SWIPE_FAST_ATTEMPTS) {
+                AD_SWIPE_MIN_RETRY_GAP_MS
+            } else {
+                AD_SWIPE_WATCHDOG_GAP_MS
+            }
             // 补扫重试：上一次上滑后广告仍在（没划走，或紧接着又是同形态广告）→ 不吃冷却直接再划。
-            // 两次之间留出最短间隔（避开广告入场动画期），并用连划上限兜底。
             // 安全性：能走到这里说明 AdRules.match 确实返回了广告动作（正剧保护在前），
             // 且页面里既没有正剧播放控件、也没有未结束的倒计时。
             val adSwipeRetry = isAdSwipe &&
                 adSwipeStreak in 1 until AD_SWIPE_MAX_ATTEMPTS &&
-                sinceLastAdSwipe in AD_SWIPE_MIN_RETRY_GAP_MS..AD_SWIPE_CHAIN_WINDOW_MS
+                chainElapsed <= AD_SWIPE_TOTAL_BUDGET_MS &&
+                sinceLastAdSwipe >= chainGap
             if (now < nextAllowedAt && !adSwipeRetry) {
                 // 冷却中不再“静默 return”：排一次“冷却结束即补扫”。
                 // 否则广告若是静止画面（没有 content change 事件），就只能干等下一条无障碍
                 // 事件（实测静止广告可十几秒无事件），表现为“莫名其妙等几秒”。
-                val remain = (nextAllowedAt - now).coerceAtLeast(50L)
-                Log.d(TAG, "动作冷却中（剩余 ${remain}ms），已排定冷却结束补扫：${action.reason}")
-                scheduleRetry(remain, "冷却结束补扫")
+                // 日志按 500ms 节流：content change 每秒可来十几次，不节流会把日志刷爆。
+                if (now - lastCooldownNoticeAt >= 500L) {
+                    lastCooldownNoticeAt = now
+                    val remain = (nextAllowedAt - now).coerceAtLeast(50L)
+                    Log.d(TAG, "动作冷却中（剩余 ${remain}ms），已排定冷却结束补扫：${action.reason}")
+                    scheduleRetry(remain, "冷却结束补扫")
+                }
                 recycleAll(nodes)
                 return
             }
@@ -291,10 +329,16 @@ class AdDetector(private val service: AccessibilityService) {
             }
             nextAllowedAt = now + cooldown
             lastActionAt = now
+            // 标记改成纯 ASCII，便于排查时 grep（控制台会把中文转码成乱码）
+            val swipeTag = if (adSwipeRetry) {
+                " [retry#${adSwipeStreak + 1} elapsed=${chainElapsed}ms" +
+                    if (adSwipeStreak >= AD_SWIPE_FAST_ATTEMPTS) " watchdog]" else "]"
+            } else {
+                ""
+            }
             Log.i(
                 TAG,
-                "匹配到广告: ${action.type} (${action.reason}) in $fgPkg" +
-                    if (adSwipeRetry) " [补扫第 ${adSwipeStreak + 1} 次]" else "",
+                "匹配到广告: ${action.type} (${action.reason}) in $fgPkg$swipeTag",
             )
             // 打印匹配节点文本，便于排查（注意：穿山甲 SurfaceView 视频广告的文字不在无障碍树里）
             action.node?.let { n ->
@@ -305,16 +349,21 @@ class AdDetector(private val service: AccessibilityService) {
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
             if (isAdSwipe) {
                 // 上滑类广告（直播渲染视图 / 穿山甲角标 / 立即领取 / “上滑继续观看”）：
-                // 上滑后主动补扫一次。若广告没被划走（同样的广告动作仍能命中），
-                // 下一次检测会不吃冷却地再划一次 —— 解决“上滑落在广告入场动画期间没生效，
-                // 结果被冷却（穿山甲 6000ms）拖住几秒”的延迟（横屏实测 6~7s → ~1s）。
-                // 达到上限后恢复正常冷却。
+                // 上滑后主动补扫。若广告没被划走（同样的广告动作仍能命中），下一次检测会
+                // 不吃冷却地再划 —— 解决“上滑落在入场动画/滑动锁期内没生效，结果被冷却拖住几秒”。
+                // 入场期快节奏 → 看门狗慢节奏，直到总预算或硬上限用尽。
+                if (adSwipeChainStartedAt == 0L) adSwipeChainStartedAt = now
                 adSwipeStreak += 1
                 lastAdSwipeAt = now
-                if (adSwipeStreak < AD_SWIPE_MAX_ATTEMPTS) {
-                    scheduleRetry(AD_SWIPE_RETRY_DELAY_MS, "广告上滑补扫")
+                val chainElapsedNow = now - adSwipeChainStartedAt
+                val inBudget = adSwipeStreak < AD_SWIPE_MAX_ATTEMPTS &&
+                    chainElapsedNow <= AD_SWIPE_TOTAL_BUDGET_MS
+                if (!inBudget) {
+                    Log.i(TAG, "连续上滑 $adSwipeStreak 次 / 累计 ${chainElapsedNow}ms，停止补扫（转正常冷却）")
+                } else if (adSwipeStreak < AD_SWIPE_FAST_ATTEMPTS) {
+                    scheduleRetry(AD_SWIPE_MIN_RETRY_GAP_MS, "广告上滑补扫")
                 } else {
-                    Log.i(TAG, "已连续上滑 $adSwipeStreak 次，停止补扫（转正常冷却）")
+                    scheduleRetry(AD_SWIPE_WATCHDOG_GAP_MS, "广告滑动锁看门狗")
                 }
             }
         } else {
@@ -333,8 +382,15 @@ class AdDetector(private val service: AccessibilityService) {
                 Log.i(TAG, "已回到正剧/“即将进入广告”前置界面，退出暂停流程")
                 pauseState = PauseState.NONE
             }
-            // 只在真正的广告页（非前置提示、非正剧播放）里尝试“点中心暂停”
-            if ((countdownFound && !upcomingAd && !inPlayback) || pauseState != PauseState.NONE) {
+            // 只在真正的广告页（非前置提示、非正剧播放）里尝试“点中心暂停”。
+            // 显式“滑动锁”（如“5s后可继续上滑观看”）期间不点中心暂停：
+            // 这种锁按时间解锁，暂停视频并不能解锁；在横屏全屏广告上点中心还有误触广告创意的风险，
+            // 而且暂停流程本身的确认超时（4s+6s）会先白等十秒。交给倒计时逻辑：锁一解除立即划走。
+            val swipeLocked = AdRules.hasSwipeLock(pageText)
+            if (swipeLocked) Log.d(TAG, "广告处于滑动锁状态（后可继续上滑观看），等待锁解除")
+            if ((countdownFound && !upcomingAd && !inPlayback && !swipeLocked) ||
+                pauseState != PauseState.NONE
+            ) {
                 if (enterPauseBeforeSwipe(fgPkg)) {
                     onResult("检测到广告上下文，正在暂停视频以直接跳过")
                     recycleAll(nodes)
@@ -409,8 +465,12 @@ class AdDetector(private val service: AccessibilityService) {
         pageText: String,
     ) {
         if (withinCountdownWindow(pageText)) {
-            // 倒计时说明广告仍在展示：清除旧动作冷却，避免“倒计时结束瞬间”被上一次动作挡住而延迟几秒
+            // 倒计时说明广告仍在展示：清除旧动作冷却，避免“倒计时结束瞬间”被上一次动作挡住而延迟几秒。
+            // 同时结束上滑链：锁期（如“5s后可继续上滑观看”）内的划动一律无效，
+            // 若把锁期当成“划了没生效”消耗掉补扫预算，锁一解除就会掉进 6s 冷却 ——
+            // 这正是“明明锁已经解除、还要再等几秒才划走”的根因（2026-10-08）。
             nextAllowedAt = 0
+            resetAdSwipeChain()
             val remain = countdownDeadlineAt - SystemClock.uptimeMillis()
             Log.i(TAG, "检测到倒计时，${remain}ms 后重扫")
             scheduleRetry(remain.coerceAtLeast(50L), "倒计时结束")

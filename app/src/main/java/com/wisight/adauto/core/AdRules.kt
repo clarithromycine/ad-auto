@@ -79,12 +79,26 @@ object AdRules {
      * 广告倒计时关键字（“3秒后可继续”“5s后继续观看”等）。
      * 这类文案本身即是广告的强信号，且倒计时结束后常出现可点击的“继续观看”按钮。
      */
+    /**
+     * 显式“滑动锁”文案（红果横屏全屏广告：“5s后可继续上滑观看”）。
+     *
+     * 锁期内滑动一律无效，必须当倒计时处理（等锁解除再划）。只收“后可…上滑”这种带“后”
+     * 的形式：锁解除后的“可继续上滑观看”不能再当倒计时，否则会永远划不走。
+     */
+    private val SWIPE_LOCK_KEYWORDS = listOf("后可继续上滑", "后可上滑", "秒后可上滑", "s后可上滑")
+
+    /** 页面是否处于“滑动锁”状态（如“5s后可继续上滑观看”）。 */
+    fun hasSwipeLock(pageText: String): Boolean {
+        val compactText = pageText.replace(Regex("\\s+"), "")
+        return SWIPE_LOCK_KEYWORDS.any { pageText.contains(it) || compactText.contains(it) }
+    }
+
     val COUNTDOWN_KEYWORDS = listOf(
         "秒后可继续", "s后可继续", "S后可继续",
         "秒后继续", "s后继续",
         "后可继续", "后继续观看", "后继续播放", "后可观看",
         "倒计时", "countdown", "CountDown",
-    )
+    ) + SWIPE_LOCK_KEYWORDS
 
     /** 倒计时正则：匹配 “3秒后”“5s后可继续”“广告倒计时 3” 等 */
     val COUNTDOWN_REGEX = Regex("\\d+\\s*(?:秒|s|S)\\s*(?:后|后可继续|后继续|后可观看|后观看|后播放)?")
