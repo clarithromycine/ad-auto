@@ -44,16 +44,16 @@ class AdDetector(private val service: AccessibilityService) {
         private const val PAUSE_FLOW_DISABLED_MS = 20_000L
         /** 暂停流程中各阶段的重扫间隔（毫秒） */
         private const val PAUSE_RESCAN_MS = 300L
-        /** 直播广告上滑后的补扫间隔（毫秒）：给划动动画/内容切换留出时间 */
-        private const val LIVE_AD_RETRY_DELAY_MS = 900L
+        /** 广告上滑后的补扫间隔（毫秒）：给划动动画/内容切换留出时间 */
+        private const val AD_SWIPE_RETRY_DELAY_MS = 900L
         /** “同一串广告”判定窗口：距上次上滑在该窗口内，说明是同一条广告没划走或紧接着又是同形态广告 */
-        private const val LIVE_AD_CHAIN_WINDOW_MS = 2_000L
+        private const val AD_SWIPE_CHAIN_WINDOW_MS = 2_000L
         /** 两次上滑之间的最短间隔：避免在广告入场动画期间连划，导致每次都打在动画上不生效 */
-        private const val LIVE_AD_MIN_RETRY_GAP_MS = 700L
+        private const val AD_SWIPE_MIN_RETRY_GAP_MS = 700L
         /** 一串广告里最多连续上滑次数：超过则转正常冷却，避免广告异常时无限连划 */
-        private const val LIVE_AD_MAX_ATTEMPTS = 6
-        /** 距上次直播广告上滑超过该时长视为整串结束，重新计数（毫秒） */
-        private const val LIVE_AD_STREAK_RESET_MS = 5_000L
+        private const val AD_SWIPE_MAX_ATTEMPTS = 6
+        /** 距上次广告上滑超过该时长视为整串结束，重新计数（毫秒） */
+        private const val AD_SWIPE_STREAK_RESET_MS = 5_000L
 
         /**
          * 悬浮球正在被拖动：拖动期间暂停广告检测，避免检测占用主线程导致拖动卡顿。
@@ -110,12 +110,13 @@ class AdDetector(private val service: AccessibilityService) {
     private var nextAllowedAt = 0L
     private var lastActionAt = 0L
     /**
-     * 直播广告连续上滑次数：“划了没生效就补扫再划”的计数（上限 LIVE_AD_MAX_ATTEMPTS）。
-     * 为 0 = 当前没有待补扫的直播广告。
+     * 广告连续上滑次数：“划了没生效就补扫再划”的计数（上限 AD_SWIPE_MAX_ATTEMPTS）。
+     * 覆盖所有上滑类广告动作（直播渲染视图 / 穿山甲角标 / 立即领取 / “上滑继续观看”）。
+     * 为 0 = 当前没有待补扫的广告。
      */
-    private var liveAdSwipeStreak = 0
-    /** 上一次直播广告上滑的时刻：间隔过久视为新一轮广告，重新计数 */
-    private var lastLiveAdSwipeAt = 0L
+    private var adSwipeStreak = 0
+    /** 上一次广告上滑的时刻：间隔过久视为新一轮广告，重新计数 */
+    private var lastAdSwipeAt = 0L
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (!SettingsManager.adSkipEnabled) {
@@ -141,7 +142,7 @@ class AdDetector(private val service: AccessibilityService) {
             pauseTappedAt = 0L
             pauseConfirmedAt = 0L
             pauseFlowDisabledUntil = 0L
-            liveAdSwipeStreak = 0
+            adSwipeStreak = 0
         }
 
         // 内容变化事件非常频繁，做节流
@@ -209,7 +210,7 @@ class AdDetector(private val service: AccessibilityService) {
             TAG,
             "scan: fg=$fgPkg nodes=${nodes.size} textLen=${pageText.length} " +
                 "renderView=${AdRules.hasAdRenderView(nodes)} countdown=$countdownFound " +
-                "streak=$liveAdSwipeStreak",
+                "streak=$adSwipeStreak",
         )
         // 传入“活动窗口屏幕范围”，供“广告角标”等位置敏感特征做过滤。
         // 用窗口根节点边界（与节点坐标同一坐标系），比 displayMetrics 更可靠（横竖屏通用）。
@@ -253,23 +254,36 @@ class AdDetector(private val service: AccessibilityService) {
                 pauseState = PauseState.NONE
             }
             val isLiveAd = action.reason == AdRules.REASON_LIVE_AD
+            // “广告上滑链式补扫”：不再只限直播广告 —— **所有上滑类广告动作**都适用
+            // （直播渲染视图 / 穿山甲角标 / 立即领取 / “上滑继续观看”）。
+            // 起因（2026-10-08）：横屏穿山甲角标广告连续上滑间隔实测 6~7s，正是 pangle 冷却；
+            // 2026-09 加的补扫只挂在直播广告上，角标/立即领取拿不到，只能干等 6s。
+            val isAdSwipe = action.type == AdActionType.SWIPE_UP
             val now = SystemClock.uptimeMillis()
-            val sinceLastLiveAdSwipe = now - lastLiveAdSwipeAt
-            // 距上次直播广告上滑已过很久 → 上一串广告结束，重新计数
-            if (isLiveAd && sinceLastLiveAdSwipe > LIVE_AD_STREAK_RESET_MS) liveAdSwipeStreak = 0
-            // 直播广告“补扫重试”：上一次上滑后广告仍在（没划走，或紧接着又是同形态广告）→ 不吃冷却直接再划。
-            // 两次之间留出最短间隔（避开广告入场动画期），并用连划上限兑底。
-            // 安全性：能走到这里说明页面里既没有正剧播放控件、也没有任何广告关键字，且渲染视图仍在。
-            val liveAdRetry = isLiveAd &&
-                liveAdSwipeStreak in 1 until LIVE_AD_MAX_ATTEMPTS &&
-                sinceLastLiveAdSwipe in LIVE_AD_MIN_RETRY_GAP_MS..LIVE_AD_CHAIN_WINDOW_MS
-            if (now < nextAllowedAt && !liveAdRetry) {
+            val sinceLastAdSwipe = now - lastAdSwipeAt
+            // 距上次广告上滑已过很久 → 上一串广告结束，重新计数
+            if (isAdSwipe && sinceLastAdSwipe > AD_SWIPE_STREAK_RESET_MS) adSwipeStreak = 0
+            // 补扫重试：上一次上滑后广告仍在（没划走，或紧接着又是同形态广告）→ 不吃冷却直接再划。
+            // 两次之间留出最短间隔（避开广告入场动画期），并用连划上限兜底。
+            // 安全性：能走到这里说明 AdRules.match 确实返回了广告动作（正剧保护在前），
+            // 且页面里既没有正剧播放控件、也没有未结束的倒计时。
+            val adSwipeRetry = isAdSwipe &&
+                adSwipeStreak in 1 until AD_SWIPE_MAX_ATTEMPTS &&
+                sinceLastAdSwipe in AD_SWIPE_MIN_RETRY_GAP_MS..AD_SWIPE_CHAIN_WINDOW_MS
+            if (now < nextAllowedAt && !adSwipeRetry) {
+                // 冷却中不再“静默 return”：排一次“冷却结束即补扫”。
+                // 否则广告若是静止画面（没有 content change 事件），就只能干等下一条无障碍
+                // 事件（实测静止广告可十几秒无事件），表现为“莫名其妙等几秒”。
+                val remain = (nextAllowedAt - now).coerceAtLeast(50L)
+                Log.d(TAG, "动作冷却中（剩余 ${remain}ms），已排定冷却结束补扫：${action.reason}")
+                scheduleRetry(remain, "冷却结束补扫")
                 recycleAll(nodes)
                 return
             }
-            // 穿山甲广告（"立即领取"触发）与直播样式广告都用更长冷却：
-            // 广告被划走后按钮/渲染视图可能短暂残留，若用默认 1500ms 会重复滑动。
-            // 直播广告已有“补扫重试”兼顾敏捷性，所以这里仍给长冷却做兜底。
+            // 穿山甲广告（角标/“立即领取”触发）与直播样式广告都用更长冷却：
+            // 广告被划走后按钮/渲染视图可能残留，若用默认 1500ms 会重复滑动。
+            // 敏捷性由上面的“广告上滑链式补扫”保证（窗口内不吃冷却），
+            // 长冷却只作为连划上限用尽后的兜底。
             val cooldown = if (isLiveAd || action.reason.contains("穿山甲广告")) {
                 pangleAdCooldown
             } else {
@@ -280,7 +294,7 @@ class AdDetector(private val service: AccessibilityService) {
             Log.i(
                 TAG,
                 "匹配到广告: ${action.type} (${action.reason}) in $fgPkg" +
-                    if (liveAdRetry) " [补扫第 ${liveAdSwipeStreak + 1} 次]" else "",
+                    if (adSwipeRetry) " [补扫第 ${adSwipeStreak + 1} 次]" else "",
             )
             // 打印匹配节点文本，便于排查（注意：穿山甲 SurfaceView 视频广告的文字不在无障碍树里）
             action.node?.let { n ->
@@ -289,21 +303,24 @@ class AdDetector(private val service: AccessibilityService) {
             val ok = perform(action)
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
-            if (isLiveAd) {
-                // 直播广告：上滑后主动补扫一次。若广告没被划走（渲染视图仍在、且仍无正剧控件），
+            if (isAdSwipe) {
+                // 上滑类广告（直播渲染视图 / 穿山甲角标 / 立即领取 / “上滑继续观看”）：
+                // 上滑后主动补扫一次。若广告没被划走（同样的广告动作仍能命中），
                 // 下一次检测会不吃冷却地再划一次 —— 解决“上滑落在广告入场动画期间没生效，
-                // 结果被 6000ms 冷却拖住几秒”的延迟。达到上限后恢复正常冷却。
-                liveAdSwipeStreak += 1
-                lastLiveAdSwipeAt = now
-                if (liveAdSwipeStreak < LIVE_AD_MAX_ATTEMPTS) {
-                    scheduleRetry(LIVE_AD_RETRY_DELAY_MS, "直播广告补扫")
+                // 结果被冷却（穿山甲 6000ms）拖住几秒”的延迟（横屏实测 6~7s → ~1s）。
+                // 达到上限后恢复正常冷却。
+                adSwipeStreak += 1
+                lastAdSwipeAt = now
+                if (adSwipeStreak < AD_SWIPE_MAX_ATTEMPTS) {
+                    scheduleRetry(AD_SWIPE_RETRY_DELAY_MS, "广告上滑补扫")
                 } else {
-                    Log.i(TAG, "直播广告已连续上滑 $liveAdSwipeStreak 次，停止补扫（转正常冷却）")
-                }            }
+                    Log.i(TAG, "已连续上滑 $adSwipeStreak 次，停止补扫（转正常冷却）")
+                }
+            }
         } else {
-            // 注意：这里**不**重置 liveAdSwipeStreak —— 已排定的“直播广告补扫”可能就在几百毫秒后，
-            // 若此刻清零，补扫那一次就会被 6s 冷却挡住，等于白排。改由 LIVE_AD_STREAK_RESET_MS
-            // （距上次直播广告上滑超过 10s）自动重置，既简单又不会误绕冷却。
+            // 注意：这里**不**重置 adSwipeStreak —— 已排定的“广告上滑补扫”可能就在几百毫秒后，
+            // 若此刻清零，补扫那一次就会被冷却挡住，等于白排。改由 AD_SWIPE_STREAK_RESET_MS
+            // （距上次广告上滑超过该时长）自动重置，既简单又不会误绕冷却。
             // 没有可直接点击/划走的按钮，需要区分两类情况：
             // A) 正剧播放中的前置提示“X秒后进入广告/即将播放广告” —— 广告还没开始、
             //    正剧仍在播放。此时绝不能点中心暂停（会把正剧暂停），只能照常等倒计时；
