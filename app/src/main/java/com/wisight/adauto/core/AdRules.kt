@@ -75,6 +75,15 @@ object AdRules {
     fun hasAdRenderView(nodes: List<AccessibilityNodeInfo>): Boolean =
         nodes.any { it.viewIdResourceName?.endsWith("/$AD_RENDER_VIEW_ID") == true }
 
+    /** “穿山甲图文/商城卡片广告”的判定原因（命名带“穿山甲广告” → 与其它穿山甲规则共享 6000ms 长冷却） */
+    const val REASON_SHOP_CARD_AD = "穿山甲广告(商城卡片)"
+
+    /** 商城卡片的固定 banner 文案（实测样本：`desc="商城好物省心选"`，位于卡片底部）。 */
+    private const val SHOP_CARD_BANNER = "好物省心选"
+
+    /** “商城卡片广告”允许的最大文字节点数：正剧/内容页/商城页的文字远多于此。 */
+    private const val MAX_SHOP_CARD_TEXT_NODES = 6
+
     /**
      * 广告倒计时关键字（“3秒后可继续”“5s后继续观看”等）。
      * 这类文案本身即是广告的强信号，且倒计时结束后常出现可点击的“继续观看”按钮。
@@ -304,6 +313,27 @@ object AdRules {
             return AdAction(AdActionType.SWIPE_UP, claimCta, reason = "穿山甲广告(立即领取)")
         }
 
+        // 1.55) 穿山甲「图文 / 商城卡片」广告（红果新版，2026-10-14）：
+        //   整屏广告创意（图集/商品卡）+ 卡片，无障碍树里**只有两个文字节点**：
+        //     · `desc="商城好物省心选"`（商城卡片固定 banner）
+        //     · `text="领取"`（右边缘常驻 CTA，**正剧也有，不能当判据**）
+        //   底部的“上滑继续看短剧”提示画在视频层上、**读不到**（与“家博会广告”那条原生
+        //   `rid=apt` 的提示不同），所以上滑关键字规则永不命中；也没有“广告”角标/倒计时/
+        //   渲染视图 → 上面所有规则全部漏掉（这就是“又跳不过了”的根因）。
+        //   实测（2026-10-14）该广告确实响应上滑 → 判定为广告并直接上滑划走。
+        if (isShopCardAd(nodes, pageText)) {
+            val banner = nodes.firstOrNull {
+                !it.contentDescription.isNullOrEmpty() &&
+                    it.contentDescription.toString().contains(SHOP_CARD_BANNER)
+            }
+            return AdAction(
+                AdActionType.SWIPE_UP,
+                banner,
+                reason = REASON_SHOP_CARD_AD,
+                immediate = true,
+            )
+        }
+
         // 1.6) Pangle 全屏广告的“广告”角标（竖屏/横屏统一）：
         // 全屏视频广告的提示文字（“上滑继续观看”等）画在视频 Surface 上，无障碍树读不到，
         // 但右上角的“广告”角标是原生节点、能稳定读到，横竖屏都会出现。
@@ -344,6 +374,33 @@ object AdRules {
         }
 
         return null
+    }
+
+    /**
+     * 页面是否为穿山甲「图文 / 商城卡片」广告（2026-10-14 实测形态）：
+     * - 页面文字出现商城卡片固定 banner（“好物省心选”）；
+     * - 且页面文字节点极少（≤ [MAX_SHOP_CARD_TEXT_NODES]）—— 正剧/内容页/商城页的文字远多于此；
+     * - 正剧播放由调用方（match 里的 hasPlaybackControls）在此之前拦掉。
+     *
+     * 实测依据（2026-10-14）：广告卡住态 `nodes=23 textLen=11`，整棵树只有两个文字节点——
+     * `desc="商城好物省心选"` 与 `text="领取"`；命中本条件后可立即上滑（实测上滑能划走）。
+     *
+     * ⚠️ **为什么不用“右边缘的『领取』CTA”作条件（实测被推翻）**：
+     * 正剧（第25集播放中）状态下同样存在一个 `text="领取"`、bounds `[1137,901][1179,989]`、
+     * 祖先为 `ViewGroup [CLICKABLE] [1068,819][1200,1071]` 的节点，**与广告里的完全一致**
+     * （且服务树 textLen=126 证明它确实被收集）—— 说明“右边缘领取”是常驻元素（红果自己的
+     * 福利入口 / SDK 常驻 widget），不是广告专属特征：单独用它会在正剧上误判。只用 banner。
+     */
+    private fun isShopCardAd(
+        nodes: List<AccessibilityNodeInfo>,
+        pageText: String,
+    ): Boolean {
+        val textNodes = nodes.count {
+            !it.text.isNullOrEmpty() || !it.contentDescription.isNullOrEmpty()
+        }
+        if (textNodes == 0 || textNodes > MAX_SHOP_CARD_TEXT_NODES) return false
+        val compactText = pageText.replace(Regex("\\s+"), "")
+        return compactText.contains(SHOP_CARD_BANNER)
     }
 
     /**

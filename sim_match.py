@@ -106,6 +106,8 @@ PLAYBACK_CONTROL_KEYWORDS = ["倍速","选集","热评","分享","评论","展�
 EPISODE_REGEX = re.compile(r'第\d+集')
 AD_CONTEXT_KEYWORDS = ["广告","advertisement"]
 COUNTDOWN_KEYWORDS = ["秒后可继续","s后可继续","S后可继续","秒后继续","s后继续","后可继续","后继续观看","后继续播放","后可观看","倒计时","countdown","CountDown"]
+# 2026-10-08: 显式“滑动锁”文案（5s后可继续上滑观看）
+COUNTDOWN_KEYWORDS += ["后可继续上滑","后可上滑","秒后可上滑","s后可上滑"]
 COUNTDOWN_REGEX = re.compile(r'\d+\s*(?:秒|s|S)\s*(?:后|后可继续|后继续|后可观看|后观看|后播放)?')
 CLICK_RULES = [
     ("跳过广告", ["跳过广告","跳过此广告","跳過廣告","Skip Ad","SkipAd"], False, False),
@@ -125,6 +127,29 @@ def find_clickable_parents(n):
         if par is None:
             return None
         cur = par
+
+# ---------- 2026-09-18 直播样式广告：具名渲染视图 ----------
+AD_RENDER_VIEW_ID = 'ttlive_player_render_view'
+has_render_view = ('/' + AD_RENDER_VIEW_ID) in xml
+
+# ---------- 2026-10-14 穿山甲图文/商城卡片广告 ----------
+# 只用 banner（商城卡片固定文案）；“右边缘领取 CTA”已实测被推翻：
+# 正剧状态下也有一个 text="领取"、bounds [1137,901][1179,989]、祖先
+# ViewGroup [CLICKABLE] [1068,819][1200,1071] 的节点，与广告里完全一致。
+SHOP_CARD_BANNER = '好物省心选'
+MAX_SHOP_CARD_TEXT_NODES = 6
+
+def is_shop_card_ad(ns):
+    text_nodes = [n for n in ns if n.text.strip() or n.desc.strip()]
+    if not text_nodes or len(text_nodes) > MAX_SHOP_CARD_TEXT_NODES:
+        return False
+    return SHOP_CARD_BANNER in compactText
+
+shop_card = is_shop_card_ad(nodes)
+print()
+print('=== 直播广告渲染视图 / 商城卡片 check ===')
+print('hasAdRenderView(ttlive_player_render_view) =', has_render_view)
+print('isShopCardAd =', shop_card, '| text nodes = %d (limit %d)' % (len(nodes), MAX_SHOP_CARD_TEXT_NODES))
 
 print()
 print('=== hasPlaybackControls check ===')
@@ -159,35 +184,38 @@ def matches(n, kw):
     return kw in n.text or kw in n.desc
 
 print()
-print('=== FINAL DECISION (order: swipe-up > playback-protection > click rules) ===')
+print('=== FINAL DECISION (order: swipe-up > playback-protection > render-view > shop-card > click rules) ===')
 if swipe_hits:
     print('>>> ACTION: SWIPE_UP (上滑继续观看) — explicit swipe-up prompt, overrides playback protection')
+elif has_pc:
+    print('>>> ACTION: none — playback controls present (正剧保护)')
+elif has_render_view:
+    print('>>> ACTION: SWIPE_UP (直播广告(渲染视图))')
+elif shop_card:
+    print('>>> ACTION: SWIPE_UP (穿山甲广告(商城卡片))')
 else:
-    if has_pc:
-        print('>>> ACTION: none — playback controls present (正剧保护)')
-    else:
-        print('>>> no swipe-up prompt and no playback protection -> checking click rules')
-        matched_any = False
-        for name, texts, req_ctx, req_cd in CLICK_RULES:
-            if req_ctx and not has_ad_context:
-                continue
-            if req_cd and not has_countdown:
-                continue
-            for n in nodes:
-                for kw in texts:
-                    if kw and matches(n, kw):
-                        clickable = find_clickable_parents(n)
-                        if clickable is not None:
-                            print('>>> MATCH: rule=%r keyword=%r node_text=%r node_desc=%r' % (name, kw, n.text[:30], n.desc[:30]))
-                            print('    clickable target: text=%r desc=%r class=%s bounds=%s' % (clickable.text[:30], clickable.desc[:30], clickable.cls, clickable.bounds))
-                            matched_any = True
-                        break
-                if matched_any:
+    print('>>> no swipe-up prompt and no playback protection -> checking click rules')
+    matched_any = False
+    for name, texts, req_ctx, req_cd in CLICK_RULES:
+        if req_ctx and not has_ad_context:
+            continue
+        if req_cd and not has_countdown:
+            continue
+        for n in nodes:
+            for kw in texts:
+                if kw and matches(n, kw):
+                    clickable = find_clickable_parents(n)
+                    if clickable is not None:
+                        print('>>> MATCH: rule=%r keyword=%r node_text=%r node_desc=%r' % (name, kw, n.text[:30], n.desc[:30]))
+                        print('    clickable target: text=%r desc=%r class=%s bounds=%s' % (clickable.text[:30], clickable.desc[:30], clickable.cls, clickable.bounds))
+                        matched_any = True
                     break
             if matched_any:
                 break
-        if not matched_any:
-            print('(current screen does NOT trigger any click rule)')
+        if matched_any:
+            break
+    if not matched_any:
+        print('(current screen does NOT trigger any click rule)')
 
 print()
 print('=== nodes containing 继续 ===')
