@@ -65,6 +65,13 @@ class AdDetector(private val service: AccessibilityService) {
         private const val AD_SWIPE_MAX_ATTEMPTS = 30
         /** 距上次广告上滑超过该时长视为整串结束，重新计数（毫秒） */
         private const val AD_SWIPE_STREAK_RESET_MS = 10_000L
+        /**
+         * “稀疏树广告”的持久性确认时长（毫秒）。
+         * 该判据是“缺失型”的（节点少 + 文字少 + 无正剧控件），**广告 → 正剧的过渡帧**
+         * 实测 `nodes=26~28 textLen=0`、只持续约 400ms 也会满足；而真实广告持续数秒以上。
+         * 因此要求该状态连续满足至少这么久才动手，避免把正剧划走。
+         */
+        private const val AD_ITEM_CONFIRM_MS = 800L
 
         /**
          * 悬浮球正在被拖动：拖动期间暂停广告检测，避免检测占用主线程导致拖动卡顿。
@@ -132,6 +139,8 @@ class AdDetector(private val service: AccessibilityService) {
     private var adSwipeChainStartedAt = 0L
     /** “冷却中”提示/补扫的节流时刻：content change 每秒可来十几次，不节流会刷爆日志 */
     private var lastCooldownNoticeAt = 0L
+    /** “稀疏树广告”状态的起始时刻：用于持久性确认（0 = 当前不是该状态） */
+    private var sparseAdSinceAt = 0L
 
     /** 结束当前“广告上滑链”（窗口切换 / 锁期等待 / 换广告时调用） */
     private fun resetAdSwipeChain() {
@@ -164,6 +173,7 @@ class AdDetector(private val service: AccessibilityService) {
             pauseConfirmedAt = 0L
             pauseFlowDisabledUntil = 0L
             resetAdSwipeChain()
+            sparseAdSinceAt = 0L
         }
 
         // 内容变化事件非常频繁，做节流
@@ -226,18 +236,41 @@ class AdDetector(private val service: AccessibilityService) {
         // 页面文本只拼接一次：关键字匹配与倒计时解析共用，避免重复遍历节点树导致主线程卡顿
         val pageText = AdRules.pageTextOf(nodes)
         val countdownFound = AdRules.hasCountdown(pageText)
-        // 排查用：本次到底看到了什么（节点数 / 文字长度 / 是否含直播广告渲染视图）
+        // 传入“活动窗口屏幕范围”，供“广告角标”等位置敏感特征做过滤。
+        // 用窗口根节点边界（与节点坐标同一坐标系），比 displayMetrics 更可靠（横竖屏通用）。
+        val frame = screenFrame()
+        val frameW = frame?.width() ?: 0
+        val frameH = frame?.height() ?: 0
+        // 排查用：本次到底看到了什么（节点数 / 文字长度 / 各渲染视图 / 是否像“稀疏树广告”）
         Log.d(
             TAG,
             "scan: fg=$fgPkg nodes=${nodes.size} textLen=${pageText.length} " +
                 "renderView=${AdRules.hasAdRenderView(nodes)} " +
                 "texView=${AdRules.hasAdRenderSurface(nodes)} " +
+                "adItem=${AdRules.hasAdItemContainer(nodes)} " +
+                "sparse=${AdRules.looksLikeSparseAdItem(nodes, pageText, frameW, frameH)} " +
                 "countdown=$countdownFound streak=$adSwipeStreak",
         )
-        // 传入“活动窗口屏幕范围”，供“广告角标”等位置敏感特征做过滤。
-        // 用窗口根节点边界（与节点坐标同一坐标系），比 displayMetrics 更可靠（横竖屏通用）。
-        val frame = screenFrame()
-        val action = AdRules.match(nodes, pageText, frame?.width() ?: 0, frame?.height() ?: 0)
+        val action = AdRules.match(nodes, pageText, frameW, frameH, fgPkg)
+        // “稀疏树”是缺失型判据：广告→正剧的过渡帧也会满足（实测 nodes=26~28 textLen=0，约 400ms），
+        // 所以要求该状态连续观测满 AD_ITEM_CONFIRM_MS 才动手；任何其它状态立即清零。
+        if (action?.reason != AdRules.REASON_SPARSE_AD) {
+            sparseAdSinceAt = 0L
+        } else {
+            val nowSparse = SystemClock.uptimeMillis()
+            if (sparseAdSinceAt == 0L) sparseAdSinceAt = nowSparse
+            val held = nowSparse - sparseAdSinceAt
+            if (held < AD_ITEM_CONFIRM_MS) {
+                Log.d(
+                    TAG,
+                    "疑似广告(稀疏树 nodes=${nodes.size} textLen=${pageText.length}) 已持续 ${held}ms，" +
+                        "${AD_ITEM_CONFIRM_MS - held}ms 后确认",
+                )
+                scheduleRetry((AD_ITEM_CONFIRM_MS - held).coerceAtLeast(50L), "稀疏树确认")
+                recycleAll(nodes)
+                return
+            }
+        }
         if (action != null) {
             // 直播样式广告（渲染视图判定）：页面无任何文字，既读不到倒计时、也没有可用的
             // 播放按钮，而点屏幕正中有“误入直播间”的风险 —— 清掉倒计时/暂停状态，直接划走。
@@ -346,6 +379,8 @@ class AdDetector(private val service: AccessibilityService) {
                 Log.i(TAG, "匹配节点 text=${n.text?.toString().orEmpty().take(20)} class=${n.className}")
             }
             val ok = perform(action)
+            // 动作后清零：避免紧接着的“广告→正剧”过渡帧（仍满足稀疏条件）被立即再次划走
+            if (action.reason == AdRules.REASON_SPARSE_AD) sparseAdSinceAt = 0L
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
             if (isAdSwipe) {

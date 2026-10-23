@@ -8,7 +8,7 @@ Includes the AdDetector scope gate added 2026-08-19: unless generic mode is
 on, AdAuto only acts inside the supported short-drama/video packages
 (default com.phoenix.read) -- see SettingsManager.supportedPackages.
 """
-import re, sys
+import re, os, sys
 import xml.etree.ElementTree as ET
 
 raw = open('ui_dump.xml', 'rb').read()
@@ -25,7 +25,8 @@ if end != -1:
     xml = xml[:end + len('</hierarchy>')]
 
 # ---------- AdDetector scope gate (2026-08-19) ----------
-GENERIC_MODE = False  # mirror SettingsManager.genericModeEnabled default
+# 可用环境变量模拟用户配置：GENERIC_MODE=1 等价于开启“通用模式”（所有 App 都检测）
+GENERIC_MODE = os.environ.get('GENERIC_MODE') == '1'  # mirror SettingsManager.genericModeEnabled
 SUPPORTED_PACKAGES = {"com.phoenix.read"}  # mirror SettingsManager.supportedPackagesList()
 root_el = ET.fromstring(xml)
 # uiautomator puts package on the first <node>, not on <hierarchy>
@@ -43,11 +44,16 @@ if not GENERIC_MODE and dump_pkg not in SUPPORTED_PACKAGES:
     sys.exit(0)
 print('>>> in scope (generic mode OR supported package), continuing analysis')
 
+# 2026-10-23: 红果专属判据只在 com.phoenix.read 上生效（稀疏树在别的 App 会误伤，如读书软件）
+HONGUO_PACKAGE = 'com.phoenix.read'
+IS_HONGUO = (dump_pkg == HONGUO_PACKAGE)
+
 class Node:
-    __slots__ = ('text', 'desc', 'cls', 'clickable', 'pkg', 'bounds', 'children')
-    def __init__(self, text, desc, cls, clickable, pkg, bounds, children):
+    __slots__ = ('text', 'desc', 'cls', 'clickable', 'pkg', 'bounds', 'rid', 'children')
+    def __init__(self, text, desc, cls, clickable, pkg, bounds, rid, children):
         self.text, self.desc, self.cls = text, desc, cls
         self.clickable, self.pkg, self.bounds = clickable, pkg, bounds
+        self.rid = rid
         self.children = children
 
 def conv(el):
@@ -56,6 +62,7 @@ def conv(el):
         cls=el.get('class', '') or '',
         clickable=(el.get('clickable') == 'true'),
         pkg=el.get('package', '') or '', bounds=el.get('bounds', '') or '',
+        rid=el.get('resource-id', '') or '',
         children=[conv(c) for c in el],
     )
 
@@ -69,8 +76,11 @@ def flatten(n):
         m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', n.bounds)
         if m:
             x1, y1, x2, y2 = map(int, m.groups())
-            if not (x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0):
-                if n.text.strip() or n.desc.strip() or 'TextureView' in n.cls:
+            # 镜像 AccessibilityNodeInfo.isVisibleToUser：跳过零面积 / 上下颠倒的框
+            # （红果广告里有一堆 [215,2038][276,1078] 这种帧，App 侧会被过滤掉）
+            if x2 > x1 and y2 > y1:
+                # 镜像 AdDetector.collectNodes：text / desc / resource-id / TextureView 四选一
+                if n.text.strip() or n.desc.strip() or n.rid.strip() or 'TextureView' in n.cls:
                     out.append(n)
     for c in n.children:
         out.extend(flatten(c))
@@ -150,11 +160,19 @@ def is_shop_card_ad(ns):
         return False
     return SHOP_CARD_BANNER in compactText
 
+# ---------- 2026-10-23 广告 feed item 容器（ay0 + i0t） ----------
+# 实测三种广告形态都有、正剧没有（正剧时这两个容器为 GONE）。
+AD_ITEM_CONTAINER_IDS = ['ay0', 'i0t']
+_all_rids = re.findall(r'resource-id="([^"]*)"', xml)
+has_ad_item = all(any(r.endswith('/' + i) for r in _all_rids) for i in AD_ITEM_CONTAINER_IDS)
+
 shop_card = is_shop_card_ad(nodes)
 print()
 print('=== 直播广告渲染视图 / 商城卡片 check ===')
+print('isHonguo(%s) = %s  <-- 红果专属判据闸门' % (HONGUO_PACKAGE, IS_HONGUO))
 print('hasAdRenderView(ttlive_player_render_view) =', has_render_view)
 print('hasAdRenderSurface(TextureView) =', has_render_surface)
+print('hasAdItemContainer(ay0+i0t) =', has_ad_item)
 print('isShopCardAd =', shop_card, '| text nodes = %d (limit %d)' % (len(nodes), MAX_SHOP_CARD_TEXT_NODES))
 
 print()
@@ -164,6 +182,22 @@ print('playback controls present:', has_pc)
 for k in PLAYBACK_CONTROL_KEYWORDS:
     if k in pageText or k in compactText:
         print('   hit keyword:', k)
+
+# ---------- 2026-10-23 名称无关兜底：稀疏树（仅竖屏） ----------
+# 实测：正剧 nodes 88~90 / textLen 108~124；广告 nodes 20~24 / textLen 0~15。
+# 横屏正剧实测 nodes=22 textLen=0，与广告撞车 -> 仅竖屏生效。
+SPARSE_AD_MAX_NODES = 40
+SPARSE_AD_MAX_TEXT_LEN = 30
+_m = re.search(r'bounds="\[0,0\]\[(\d+),(\d+)\]"', xml)
+SCREEN_W, SCREEN_H = (int(_m.group(1)), int(_m.group(2))) if _m else (0, 0)
+looks_sparse = (
+    SCREEN_W > 0 and SCREEN_H > 0 and SCREEN_W < SCREEN_H
+    and len(nodes) <= SPARSE_AD_MAX_NODES
+    and len(pageText) <= SPARSE_AD_MAX_TEXT_LEN
+    and not has_pc
+)
+print('looksLikeSparseAdItem =', looks_sparse,
+      '| screen=%dx%d nodes=%d textLen=%d' % (SCREEN_W, SCREEN_H, len(nodes), len(pageText)))
 
 print()
 print('=== SWIPE_UP check ===')
@@ -195,10 +229,14 @@ if swipe_hits:
     print('>>> ACTION: SWIPE_UP (上滑继续观看) — explicit swipe-up prompt, overrides playback protection')
 elif has_pc:
     print('>>> ACTION: none — playback controls present (正剧保护)')
-elif has_render_view:
+elif IS_HONGUO and shop_card:
+    print('>>> ACTION: SWIPE_UP (穿山甲广告(商城卡片))')
+elif IS_HONGUO and has_render_view:
     print('>>> ACTION: SWIPE_UP (直播广告(渲染视图))')
-elif has_render_surface:
+elif IS_HONGUO and has_render_surface:
     print('>>> ACTION: SWIPE_UP (广告(渲染视图TextureView))')
+elif IS_HONGUO and has_ad_item:
+    print('>>> ACTION: SWIPE_UP (广告(广告布局容器))')
 elif shop_card:
     print('>>> ACTION: SWIPE_UP (穿山甲广告(商城卡片))')
 else:
@@ -224,6 +262,8 @@ else:
             break
     if not matched_any:
         print('(current screen does NOT trigger any click rule)')
+        if IS_HONGUO and looks_sparse:
+            print('>>> ACTION: SWIPE_UP (广告(稀疏树)) [需 800ms 持久性确认]')
 
 print()
 print('=== nodes containing 继续 ===')

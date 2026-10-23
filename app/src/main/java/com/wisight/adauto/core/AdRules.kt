@@ -71,6 +71,20 @@ object AdRules {
     /** “直播样式广告”的判定原因，供 AdDetector 识别该分支（直接划走 + 更长冷却） */
     const val REASON_LIVE_AD = "直播广告(渲染视图)"
 
+    /**
+     * 红果（`com.phoenix.read`）——**唯一**做了专属适配的 App。
+     *
+     * 下面这些**红果专属判据**（渲染视图 / 广告角标 / 商城卡片 banner / 广告 item 容器 / 稀疏树）
+     * 全部只在这个包上生效。原因：它们都是针对红果的广告形态逐个取证出来的启发式，
+     * 而“稀疏树”本质是**缺失型**判据（靠“节点少 + 文字少”反推广告），跨 App 通用会误伤 ——
+     * 实测反馈：某读书 App 用 Canvas/SurfaceView 画正文，无障碍树同样“稀疏”，
+     * 被判据兜住后一直自动划页。
+     *
+     * 其余**通用规则**（上滑关键字 / 跳过·关闭点击 / 倒计时）不受此限制，
+     * 仍可在“通用模式”或用户自定义的支持包名里生效。
+     */
+    const val HONGUO_PACKAGE = "com.phoenix.read"
+
     /** 节点集合里是否存在直播广告的渲染视图（页面无文字可读，只能靠这个具名 id 判定）。 */
     fun hasAdRenderView(nodes: List<AccessibilityNodeInfo>): Boolean =
         nodes.any { it.viewIdResourceName?.endsWith("/$AD_RENDER_VIEW_ID") == true }
@@ -94,6 +108,62 @@ object AdRules {
     /** 节点集合里是否存在 TextureView 类型的渲染视图（广告创意画的 surface）。 */
     fun hasAdRenderSurface(nodes: List<AccessibilityNodeInfo>): Boolean =
         nodes.any { it.className?.toString()?.contains(AD_RENDER_VIEW_CLASS) == true }
+
+    /**
+     * 红果「广告 feed item」的布局容器 id（`ay0` + `i0t`）。
+     *
+     * 实测（同一时期同一版本）三种广告形态的无障碍树里**都同时包含**这两个 id：
+     * - 2026-10-14 Pangle 图文/商城卡片（肯德基疯狂星期四，图集 0/4）
+     * - 2026-10-23 台球王者试玩广告（创意画在无 id 的 TextureView 上）
+     * - 2026-10-23 iQOO 电商卡片广告（创意是图片，文字只剩“叮～送你/7/折优惠券/7折”碎碎片）
+     * 而正剧 dump（84 个 id）里**两个都没有** → 说明它们是广告 item 的容器（正剧时为 GONE）。
+     * 这条能盖住“创意全画在图片里、无障碍树几乎无字”的广告——这类前面的所有规则都认不出。
+     *
+     * ⚠️ 这两个是混淆后的短名，红果升级可能改名；失效时只会“漏跳”（安全方向），
+     * 届时按新样本重新取证即可。
+     */
+    private val AD_ITEM_CONTAINER_IDS = listOf("ay0", "i0t")
+
+    /** “广告 feed item 容器”的判定原因 */
+    const val REASON_AD_ITEM = "广告(广告布局容器)"
+
+    /** 节点集合里是否同时存在广告 item 的两个容器 id（单个出现不算）。 */
+    fun hasAdItemContainer(nodes: List<AccessibilityNodeInfo>): Boolean =
+        AD_ITEM_CONTAINER_IDS.all { id ->
+            nodes.any { it.viewIdResourceName?.endsWith("/$id") == true }
+        }
+
+    /** “稀疏树广告”兜底判据的上限（实测：正剧 nodes 88~90 / textLen 108~124；广告 nodes 20~24 / textLen 0~15） */
+    private const val SPARSE_AD_MAX_NODES = 40
+    private const val SPARSE_AD_MAX_TEXT_LEN = 30
+
+    /** “稀疏树广告”的判定原因 */
+    const val REASON_SPARSE_AD = "广告(稀疏树)"
+
+    /**
+     * **名称无关**的“广告 item”兜底判据（2026-10-23 用户提出：节点/id 数差异明显）。
+     *
+     * 条件（全部满足）：
+     * - **仅竖屏**：[screenW] < [screenH]。横屏正剧实测 `nodes=22 textLen=0`，与广告特征完全撞车；
+     * - 收集节点数 ≤ [SPARSE_AD_MAX_NODES]（正剧 88~90；广告实测 20~24）；
+     * - 文字总量 ≤ [SPARSE_AD_MAX_TEXT_LEN] 字符（正剧 108~124；广告 0~15）；
+     * - 没有正剧播放控件（[hasPlaybackControls]）。
+     *
+     * ⚠️ 这是“缺失型”判据：**广告 → 正剧的过渡帧**（实测 `nodes=26~28 textLen=0`，持续约 400ms）
+     * 同样满足，所以调用方必须做**持久性确认**：AdDetector 里连续观测满
+     * `AD_ITEM_CONFIRM_MS`（800ms）才动手，且动作后清零重新确认。
+     */
+    fun looksLikeSparseAdItem(
+        nodes: List<AccessibilityNodeInfo>,
+        pageText: String,
+        screenW: Int,
+        screenH: Int,
+    ): Boolean {
+        if (screenW <= 0 || screenH <= 0 || screenW >= screenH) return false
+        if (nodes.size > SPARSE_AD_MAX_NODES) return false
+        if (pageText.length > SPARSE_AD_MAX_TEXT_LEN) return false
+        return !hasPlaybackControls(pageText)
+    }
 
     /** “穿山甲图文/商城卡片广告”的判定原因（命名带“穿山甲广告” → 与其它穿山甲规则共享 6000ms 长冷却） */
     const val REASON_SHOP_CARD_AD = "穿山甲广告(商城卡片)"
@@ -271,15 +341,20 @@ object AdRules {
      *
      * @param screenW/screenH 当前屏幕尺寸（像素）。用于对“广告”角标这类位置敏感的
      *        特征做位置过滤；为 0 时跳过位置过滤（向后兼容直接调用）。
+     * @param pkg 当前前台包名。红果专属判据只对 [HONGUO_PACKAGE] 生效；
+     *        传空（或不匹配）时这些判据全部跳过，只保留通用规则。
      */
     fun match(
         nodes: List<AccessibilityNodeInfo>,
         pageText: String,
         screenW: Int = 0,
         screenH: Int = 0,
+        pkg: String = "",
     ): AdAction? {
         // 去掉空白后做匹配，兼容“上滑 继续看短剧”这类带空格写法
         val compactText = pageText.replace(Regex("\\s+"), "")
+        // 红果专属判据闸门（见 HONGUO_PACKAGE 注释）
+        val isHonguo = pkg == HONGUO_PACKAGE
 
         // 1) “上滑继续观看短剧”类广告 -> 上滑。
         //    这类提示词带明确方向（上滑），是硬性广告信号，正常播放时绝不会出现，
@@ -307,7 +382,7 @@ object AdRules {
         //     点击规则全部失效（这就是“直播广告跳不过”的根因）。
         //     该渲染视图是具名 id 且广告独有（正剧始终走 SurfaceView），据此判定为广告 → 上滑。
         //     位置放在正剧保护之后：万一将来正剧也复用它，正剧保护仍然优先。
-        if (hasAdRenderView(nodes)) {
+        if (isHonguo && hasAdRenderView(nodes)) {
             val renderView = nodes.firstOrNull {
                 it.viewIdResourceName?.endsWith("/$AD_RENDER_VIEW_ID") == true
             }
@@ -324,7 +399,7 @@ object AdRules {
         //    无可点节点、无角标/倒计时/具名 id，且上一条（具名 id）认不出来。
         //    实测：正剧始终走 android.view.SurfaceView、不会出现 TextureView；
         //    且本分支位于正剧保护（hasPlaybackControls）之后，双重保险。
-        if (hasAdRenderSurface(nodes)) {
+        if (isHonguo && hasAdRenderSurface(nodes)) {
             val surface = nodes.firstOrNull {
                 it.className?.toString()?.contains(AD_RENDER_VIEW_CLASS) == true
             }
@@ -332,6 +407,22 @@ object AdRules {
                 AdActionType.SWIPE_UP,
                 surface,
                 reason = REASON_AD_SURFACE,
+                immediate = true,
+            )
+        }
+
+        // 1.72) 红果「广告 feed item」容器（2026-10-23）：
+        //   有些广告创意整张画在图片/位图里，无障碍树几乎无字 —— 实测 iQOO 电商卡片广告：
+        //   `nodes=24 textLen=15`，文字只剩优惠券动画的碎片（“叮～送你 / 7 / 折优惠券 / 7折”），
+        //   无“广告”角标/倒计时/渲染视图/banner → 上面所有规则全部漏掉。
+        //   而这类广告的无障碍树里稳定含有 `id/ay0` + `id/i0t` 两个广告 item 容器
+        //   （实测 3 种广告形态都有、正剧 84 个 id 里都没有）。
+        //   护栏：位于正剧保护之后；且两个 id 必须同时出现。
+        if (isHonguo && hasAdItemContainer(nodes)) {
+            return AdAction(
+                AdActionType.SWIPE_UP,
+                null,
+                reason = REASON_AD_ITEM,
                 immediate = true,
             )
         }
@@ -358,7 +449,7 @@ object AdRules {
         //   `rid=apt` 的提示不同），所以上滑关键字规则永不命中；也没有“广告”角标/倒计时/
         //   渲染视图 → 上面所有规则全部漏掉（这就是“又跳不过了”的根因）。
         //   实测（2026-10-14）该广告确实响应上滑 → 判定为广告并直接上滑划走。
-        if (isShopCardAd(nodes, pageText)) {
+        if (isHonguo && isShopCardAd(nodes, pageText)) {
             val banner = nodes.firstOrNull {
                 !it.contentDescription.isNullOrEmpty() &&
                     it.contentDescription.toString().contains(SHOP_CARD_BANNER)
@@ -377,7 +468,7 @@ object AdRules {
         // 只要页面上没有倒计时（倒计时走“点中心暂停”流程）、不是“X秒后进入广告”前置提示
         // （正剧仍在播），且没有正剧播放控件（上方 hasPlaybackControls 已拦截），
         // 就判定为广告并直接上滑划走。
-        if (!hasCountdown(pageText) && !hasUpcomingAd(pageText)) {
+        if (isHonguo && !hasCountdown(pageText) && !hasUpcomingAd(pageText)) {
             val badge = findAdBadgeNode(nodes, screenW, screenH)
             if (badge != null) {
                 return AdAction(AdActionType.SWIPE_UP, badge, reason = "穿山甲广告(角标)")
@@ -408,6 +499,20 @@ object AdRules {
                 val hit = custom.firstOrNull { node.matches(it) } ?: continue
                 return AdAction(AdActionType.CLICK, clickable, reason = "自定义:$hit")
             }
+        }
+
+        // 3.5) 名称无关兜底：稀疏树（放在所有正向规则之后，让精确判据优先）
+        //     覆盖“创意整张画在位图/表面里、无障碍树几乎没有内容”的新广告，
+        //     不依赖任何具体的 id 名或创意文案。安全性见 looksLikeSparseAdItem 注释。
+        //     ⚠️ 仅对红果生效：这是缺失型判据，用在别的 App 上会把“Canvas/Surface 画正文”
+        //     的页面（如读书软件）当成广告一直划（实测反馈）。
+        if (isHonguo && looksLikeSparseAdItem(nodes, pageText, screenW, screenH)) {
+            return AdAction(
+                AdActionType.SWIPE_UP,
+                null,
+                reason = REASON_SPARSE_AD,
+                immediate = true,
+            )
         }
 
         return null

@@ -503,6 +503,15 @@
                         android:layout_gravity="center_vertical" />
                 </LinearLayout>
 
+                <TextView
+                    android:id="@+id/tvScopeStatus"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/rule_scope_status_limited"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+
                 <com.google.android.material.textfield.TextInputLayout
                     android:id="@+id/inputLayoutScope"
                     style="@style/Widget.Material3.TextInputLayout.OutlinedBox"

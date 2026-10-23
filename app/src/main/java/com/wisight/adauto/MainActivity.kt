@@ -34,13 +34,41 @@ class MainActivity : AppCompatActivity() {
         setupListeners()
         binding.etCustomKeywords.setText(SettingsManager.customKeywords)
         binding.etSupportedPackages.setText(SettingsManager.supportedPackages)
-        binding.switchGenericMode.isChecked = SettingsManager.genericModeEnabled
+        // 开关语义：开 = 仅检测下方 App（与文案一致）；关 = 检测所有 App（通用模式）。
+        // 之前是直接映射 genericModeEnabled，导致“打开推荐开关”反而变成全 App 检测。
+        binding.switchGenericMode.isChecked = !SettingsManager.genericModeEnabled
+        updateScopeStatus()
         requestNotificationPermissionIfNeeded()
     }
 
     override fun onResume() {
         super.onResume()
         refreshStatus()
+        updateScopeStatus()
+    }
+
+    /** 刷新“自动跳过范围”的实时提示：直接显示出当前生效范围 / 待保存状态，避免误读开关含义 */
+    private fun updateScopeStatus() {
+        val limitToPackages = binding.switchGenericMode.isChecked
+        val savedLimit = !SettingsManager.genericModeEnabled
+        val text: String
+        val color: Int
+        when {
+            limitToPackages != savedLimit -> {
+                text = getString(R.string.rule_scope_status_pending)
+                color = ContextCompat.getColor(this, R.color.text_secondary)
+            }
+            limitToPackages -> {
+                text = getString(R.string.rule_scope_status_limited)
+                color = ContextCompat.getColor(this, R.color.status_green)
+            }
+            else -> {
+                text = getString(R.string.rule_scope_status_generic)
+                color = ContextCompat.getColor(this, R.color.status_red)
+            }
+        }
+        binding.tvScopeStatus.text = text
+        binding.tvScopeStatus.setTextColor(color)
     }
 
     private fun setupListeners() {
@@ -65,10 +93,14 @@ class MainActivity : AppCompatActivity() {
             // 窗口保留 → 前台服务不必停 → App 不会被 MIUI/HyperOS 在后台挂起（否则就不会跳广告了）。
             if (checked) startBall() else FloatingBallService.start(this)
         }
+        // “自动跳过范围”开关只改 UI 状态提示，真正写入要等点“保存规则”（与包名输入框同组）
+        binding.switchGenericMode.setOnCheckedChangeListener { _, _ -> updateScopeStatus() }
         binding.btnSaveRules.setOnClickListener {
             SettingsManager.customKeywords = binding.etCustomKeywords.text?.toString()?.trim().orEmpty()
             SettingsManager.supportedPackages = binding.etSupportedPackages.text?.toString()?.trim().orEmpty()
-            SettingsManager.genericModeEnabled = binding.switchGenericMode.isChecked
+            // 开关语义：开 = 仅检测下方 App → genericModeEnabled = 取反
+            SettingsManager.genericModeEnabled = !binding.switchGenericMode.isChecked
+            updateScopeStatus()
             Toast.makeText(this, R.string.toast_rule_saved, Toast.LENGTH_SHORT).show()
         }
         binding.btnScanNow.setOnClickListener {
