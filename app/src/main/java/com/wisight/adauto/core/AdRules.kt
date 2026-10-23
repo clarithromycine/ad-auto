@@ -75,6 +75,26 @@ object AdRules {
     fun hasAdRenderView(nodes: List<AccessibilityNodeInfo>): Boolean =
         nodes.any { it.viewIdResourceName?.endsWith("/$AD_RENDER_VIEW_ID") == true }
 
+    /**
+     * 广告创意渲染视图的**类名**。
+     *
+     * 2026-10-23 实测（台球试玩/游戏落地广告）：创意改用**没有 resource-id 的 `TextureView`**
+     * 挂载，整屏游戏 UI / 按钮 / “上滑继续看短剧”提示全画在 surface 上 → 无障碍树里
+     * **0 个文字节点、只有 1 个可点击节点（左上返回）**，`countdown=false`，
+     * 上面所有按文字/具名 id 的规则全部 miss（这就是“又一次跳不过”的根因）。
+     * 同一时段的正剧对照：用的是 `android.view.SurfaceView`（[0,0][1200,2360]），
+     * **全程没有 TextureView**（与 2026-09 的结论一致：正剧走 SurfaceView）。
+     * 因此判据从“具名 id”泛化为“类名”：只要出现 TextureView 就当作广告渲染视图。
+     */
+    const val AD_RENDER_VIEW_CLASS = "TextureView"
+
+    /** “广告创意渲染视图（无 id 的 TextureView）”的判定原因 */
+    const val REASON_AD_SURFACE = "广告(渲染视图TextureView)"
+
+    /** 节点集合里是否存在 TextureView 类型的渲染视图（广告创意画的 surface）。 */
+    fun hasAdRenderSurface(nodes: List<AccessibilityNodeInfo>): Boolean =
+        nodes.any { it.className?.toString()?.contains(AD_RENDER_VIEW_CLASS) == true }
+
     /** “穿山甲图文/商城卡片广告”的判定原因（命名带“穿山甲广告” → 与其它穿山甲规则共享 6000ms 长冷却） */
     const val REASON_SHOP_CARD_AD = "穿山甲广告(商城卡片)"
 
@@ -295,6 +315,23 @@ object AdRules {
                 AdActionType.SWIPE_UP,
                 renderView,
                 reason = REASON_LIVE_AD,
+                immediate = true,
+            )
+        }
+
+        // 1.71) 无 id 的 TextureView 渲染视图（2026-10-23 新形态：台球试玩/游戏落地广告）：
+        //    创意（游戏 UI、按钮、“上滑继续看短剧”提示）全画在 TextureView 上 → 树里 0 文字、
+        //    无可点节点、无角标/倒计时/具名 id，且上一条（具名 id）认不出来。
+        //    实测：正剧始终走 android.view.SurfaceView、不会出现 TextureView；
+        //    且本分支位于正剧保护（hasPlaybackControls）之后，双重保险。
+        if (hasAdRenderSurface(nodes)) {
+            val surface = nodes.firstOrNull {
+                it.className?.toString()?.contains(AD_RENDER_VIEW_CLASS) == true
+            }
+            return AdAction(
+                AdActionType.SWIPE_UP,
+                surface,
+                reason = REASON_AD_SURFACE,
                 immediate = true,
             )
         }

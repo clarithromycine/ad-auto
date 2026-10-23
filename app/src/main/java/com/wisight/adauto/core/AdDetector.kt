@@ -230,8 +230,9 @@ class AdDetector(private val service: AccessibilityService) {
         Log.d(
             TAG,
             "scan: fg=$fgPkg nodes=${nodes.size} textLen=${pageText.length} " +
-                "renderView=${AdRules.hasAdRenderView(nodes)} countdown=$countdownFound " +
-                "streak=$adSwipeStreak",
+                "renderView=${AdRules.hasAdRenderView(nodes)} " +
+                "texView=${AdRules.hasAdRenderSurface(nodes)} " +
+                "countdown=$countdownFound streak=$adSwipeStreak",
         )
         // 传入“活动窗口屏幕范围”，供“广告角标”等位置敏感特征做过滤。
         // 用窗口根节点边界（与节点坐标同一坐标系），比 displayMetrics 更可靠（横竖屏通用）。
@@ -728,9 +729,12 @@ class AdDetector(private val service: AccessibilityService) {
             // 只保留“带文字/内容描述”或“带资源 id”的节点，可大幅减少节点数与主线程开销（拖动悬浮球更跟手）。
             // 必须额外保留带资源 id 的节点：直播样式广告的渲染视图（TextureView
             // `ttlive_player_render_view`）没有任何文字，只能靠资源 id 识别（见 AdRules.hasAdRenderView）。
+            // 同理必须保留 TextureView 类节点：2026-10 的试玩/游戏广告把创意画在**没有 id 的**
+            // TextureView 上，只能靠类名识别（见 AdRules.hasAdRenderSurface）。
             if (!node.text.isNullOrEmpty() ||
                 !node.contentDescription.isNullOrEmpty() ||
-                !node.viewIdResourceName.isNullOrEmpty()
+                !node.viewIdResourceName.isNullOrEmpty() ||
+                node.className?.toString()?.contains(AdRules.AD_RENDER_VIEW_CLASS) == true
             ) {
                 out.add(node)
             }

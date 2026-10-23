@@ -70,7 +70,7 @@ def flatten(n):
         if m:
             x1, y1, x2, y2 = map(int, m.groups())
             if not (x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0):
-                if n.text.strip() or n.desc.strip():
+                if n.text.strip() or n.desc.strip() or 'TextureView' in n.cls:
                     out.append(n)
     for c in n.children:
         out.extend(flatten(c))
@@ -132,6 +132,11 @@ def find_clickable_parents(n):
 AD_RENDER_VIEW_ID = 'ttlive_player_render_view'
 has_render_view = ('/' + AD_RENDER_VIEW_ID) in xml
 
+# ---------- 2026-10-23 无 id 的 TextureView 渲染视图（试玩/游戏广告） ----------
+# 正剧始终走 android.view.SurfaceView，不会出现 TextureView（实测对照）。
+AD_RENDER_VIEW_CLASS = 'TextureView'
+has_render_surface = any(AD_RENDER_VIEW_CLASS in n.cls for n in nodes)
+
 # ---------- 2026-10-14 穿山甲图文/商城卡片广告 ----------
 # 只用 banner（商城卡片固定文案）；“右边缘领取 CTA”已实测被推翻：
 # 正剧状态下也有一个 text="领取"、bounds [1137,901][1179,989]、祖先
@@ -149,6 +154,7 @@ shop_card = is_shop_card_ad(nodes)
 print()
 print('=== 直播广告渲染视图 / 商城卡片 check ===')
 print('hasAdRenderView(ttlive_player_render_view) =', has_render_view)
+print('hasAdRenderSurface(TextureView) =', has_render_surface)
 print('isShopCardAd =', shop_card, '| text nodes = %d (limit %d)' % (len(nodes), MAX_SHOP_CARD_TEXT_NODES))
 
 print()
@@ -191,6 +197,8 @@ elif has_pc:
     print('>>> ACTION: none — playback controls present (正剧保护)')
 elif has_render_view:
     print('>>> ACTION: SWIPE_UP (直播广告(渲染视图))')
+elif has_render_surface:
+    print('>>> ACTION: SWIPE_UP (广告(渲染视图TextureView))')
 elif shop_card:
     print('>>> ACTION: SWIPE_UP (穿山甲广告(商城卡片))')
 else:
