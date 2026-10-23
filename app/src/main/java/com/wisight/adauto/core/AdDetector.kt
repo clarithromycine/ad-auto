@@ -36,8 +36,6 @@ class AdDetector(private val service: AccessibilityService) {
         private const val COUNTDOWN_BUFFER_MS = 300L
         /** 超过该秒数的倒计时不精确等待（异常文案，避免长时间挂起） */
         private const val MAX_COUNTDOWN_SECONDS = 30
-        /** 点中心暂停后，等待“中间播放按钮出现”的确认超时（毫秒） */
-        private const val PAUSE_CONFIRM_TIMEOUT_MS = 4_000L
         /** 已确认暂停后，等待底部“上滑”提示出现的最长时间（毫秒），超时则回退原逻辑 */
         private const val PAUSED_PROMPT_TIMEOUT_MS = 6_000L
         /** 一次暂停流程失败后，本广告内不再尝试点暂停的冷却时长（毫秒） */
@@ -93,16 +91,17 @@ class AdDetector(private val service: AccessibilityService) {
     private var lastParsedSeconds = -1
 
     /**
-     * 广告“点中心暂停”流程状态：
+     * 广告暂停态检测（**只读**，不主动点击）：
      * - NONE：正常 / 未进入；
-     * - WAIT_PAUSE：已点击屏幕中间，等待中间播放按钮出现（确认已暂停）；
-     * - PAUSED：已确认暂停（检测到播放按钮），等待底部“上滑继续观看”提示出现后按原逻辑划走。
+     * - PAUSED：检测到中央播放按钮（广告已暂停），等待底部“上滑继续观看”提示出现后按原逻辑划走。
+     *
+     * ⚠️ 2026-10-23 已移除“主动点屏幕正中暂停”的动作：实测反馈某些直播类/落地页广告
+     * 会把“点中心”当成点击广告创意，过几秒就自动进入直播间 —— 风险远大于收益，
+     * 现在回退为“等倒计时结束再滑动”。
      */
-    private enum class PauseState { NONE, WAIT_PAUSE, PAUSED }
+    private enum class PauseState { NONE, PAUSED }
 
     private var pauseState = PauseState.NONE
-    /** 点击屏幕中间的时刻（用于判断暂停确认是否超时） */
-    private var pauseTappedAt = 0L
     /** 确认暂停的时刻（用于限制“已暂停但提示未出现”的等待时间） */
     private var pauseConfirmedAt = 0L
     /** 暂停流程失败后的禁用截止时刻：本广告内不再反复点中心，回退原倒计时逻辑 */
@@ -169,7 +168,6 @@ class AdDetector(private val service: AccessibilityService) {
             countdownDeadlineAt = 0L
             lastParsedSeconds = -1
             pauseState = PauseState.NONE
-            pauseTappedAt = 0L
             pauseConfirmedAt = 0L
             pauseFlowDisabledUntil = 0L
             resetAdSwipeChain()
@@ -296,7 +294,7 @@ class AdDetector(private val service: AccessibilityService) {
                 // 显式“滑动锁”（如“5s后可继续上滑观看”）期间不点中心暂停：
                 // 这种锁按时间解锁，暂停视频并不能解锁，反而在横屏全屏广告上有误触风险。
                 if (!AdRules.hasSwipeLock(pageText) && enterPauseBeforeSwipe(fgPkg)) {
-                    onResult("检测到需倒计时的广告，正在点中心暂停后直接划走")
+                    onResult("检测到需倒计时的广告（视频已暂停），等待上滑提示后直接划走")
                     recycleAll(nodes)
                     return
                 }
@@ -428,7 +426,7 @@ class AdDetector(private val service: AccessibilityService) {
                 pauseState != PauseState.NONE
             ) {
                 if (enterPauseBeforeSwipe(fgPkg)) {
-                    onResult("检测到广告上下文，正在暂停视频以直接跳过")
+                    onResult("检测到广告上下文（视频已暂停），等待上滑提示后直接跳过")
                     recycleAll(nodes)
                     return
                 }
@@ -554,49 +552,35 @@ class AdDetector(private val service: AccessibilityService) {
     }
 
     /**
-     * “需要倒计时等待”的广告：通过“点击屏幕中间让视频暂停”立即解锁滑动。
+     * “需要倒计时等待”的广告：过去会“点一下屏幕正中让视频暂停”以提前解锁滑动。
      *
-     * 策略：遇到需倒计时等待的广告，先点一下屏幕中间暂停视频（暂停状态下中间会出现
-     * 播放按钮，用它判定“已暂停”）；暂停后底部“上滑继续观看短剧”提示立即变为可滑动，
-     * 后续仍走原逻辑——检测到提示满足后自动上滑划走，无需被动等倒计时走完。
+     * ⚠️ 2026-10-23 起**不再主动点击**（实测反馈：某些直播类/落地页广告会把“点中心”
+     * 当成点击广告创意，几秒后就自动进入直播间/落地页）。现在只做两件事：
+     * 1) 如果广告**已经**处于暂停态（中央有播放按钮），就等底部“上滑”提示出现后划走；
+     * 2) 否则直接返回 false，让调用方回退到“等倒计时结束再滑”的老逻辑（仍能跳过，只是多等几秒）。
      *
-     * @return true=已接管调度（已点暂停/正在等待确认/已暂停等待提示）；
-     *         false=确认超时/不适用，调用方应回退到原“倒计时等待”逻辑。
+     * @return true=已接管调度（已处于暂停态，等待上滑提示）；false=不适用，调用方回退倒计时等待。
      */
     private fun enterPauseBeforeSwipe(fgPkg: String): Boolean {
         val now = SystemClock.uptimeMillis()
         when (pauseState) {
             PauseState.NONE -> {
-                // 本广告的暂停流程已失败过：不再反复点中心，直接回退原倒计时逻辑
+                // 本广告的暂停流程已判定不适用：直接回退原倒计时逻辑
                 if (now < pauseFlowDisabledUntil) return false
                 if (hasCenterPlayButton(fgPkg)) {
+                    // 广告已经处于暂停态（可能是用户自己点的）：直接等底部“上滑”提示出现即可
                     Log.i(TAG, "广告已处于暂停态（中间出现播放按钮），等待下方上滑提示")
                     pauseState = PauseState.PAUSED
                     pauseConfirmedAt = now
-                } else {
-                    Log.i(TAG, "倒计时广告：点击屏幕中间暂停视频")
-                    tapCenter()
-                    pauseState = PauseState.WAIT_PAUSE
-                    pauseTappedAt = now
+                    scheduleRetry(PAUSE_RESCAN_MS, "暂停确认/等待")
+                    return true
                 }
-                scheduleRetry(PAUSE_RESCAN_MS, "暂停确认/等待")
-                return true
-            }
-            PauseState.WAIT_PAUSE -> {
-                if (hasCenterPlayButton(fgPkg)) {
-                    Log.i(TAG, "已确认暂停（检测到中间播放按钮），等待下方上滑提示出现")
-                    pauseState = PauseState.PAUSED
-                    pauseConfirmedAt = now
-                    scheduleRetry(PAUSE_RESCAN_MS, "已暂停等待提示")
-                } else if (now - pauseTappedAt < PAUSE_CONFIRM_TIMEOUT_MS) {
-                    scheduleRetry(PAUSE_RESCAN_MS, "等待播放按钮出现")
-                } else {
-                    Log.w(TAG, "暂停确认超时，本广告回退倒计时等待逻辑")
-                    pauseState = PauseState.NONE
-                    pauseFlowDisabledUntil = now + PAUSE_FLOW_DISABLED_MS
-                    return false
-                }
-                return true
+                // 不再主动“点屏幕正中”：
+                // 该动作在直播类/落地页广告上会被识别为点击广告创意，导致“过几秒自动进入直播间/落地页”。
+                // 放弃暂停流程后，调用方会回退到“等倒计时结束再滑动” —— 仍能跳过，只多等几秒，但零误点风险。
+                Log.i(TAG, "跳过“点中心暂停”（避免误点广告创意），改为等倒计时结束再划")
+                pauseFlowDisabledUntil = now + PAUSE_FLOW_DISABLED_MS
+                return false
             }
             PauseState.PAUSED -> {
                 // 已暂停：短周期重扫，直到底部“上滑继续观看”提示渲染出来（由 action 分支划走）。
@@ -614,22 +598,10 @@ class AdDetector(private val service: AccessibilityService) {
         }
     }
 
-    /** 点击屏幕正中央（用于暂停倒计时广告的视频） */
-    private fun tapCenter(): Boolean {
-        val dm = service.resources.displayMetrics
-        val cx = dm.widthPixels * 0.5f
-        val cy = dm.heightPixels * 0.5f
-        val path = Path().apply { moveTo(cx, cy) }
-        val stroke = GestureDescription.StrokeDescription(path, 0, 60)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        Log.i(TAG, "tapCenter($cx,$cy)")
-        return service.dispatchGesture(gesture, null, null)
-    }
-
     /**
      * 检测屏幕中央是否出现“播放按钮”（视频已暂停的标志）。
-     * 倒计时广告点击屏幕暂停后，视频层中央会出现一个居中的播放图标
-     * （多为无文字的 ImageView），用它判定“视频已暂停”。
+     * **只读判定**：仅用于“广告已经处于暂停态”时直接划走，不会主动点击屏幕。
+     * 暂停态下视频层中央会出现一个居中的播放图标（多为无文字的 ImageView）。
      * 返回 true 表示中央区域存在播放按钮。
      */
     private fun hasCenterPlayButton(fgPkg: String): Boolean {
@@ -717,6 +689,9 @@ class AdDetector(private val service: AccessibilityService) {
         return when (action.type) {
             AdActionType.CLICK -> {
                 val node = action.node ?: return false
+                // 拒绝“整屏级”点击目标：那几乎都是广告创意/整页容器，点它等于点进落地页/直播间
+                // （2026-10-23 用户反馈某些直播类广告会“过几秒点进去”）。
+                if (isOversizedClickTarget(node)) return false
                 try {
                     node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                 } catch (_: Throwable) {
@@ -729,6 +704,28 @@ class AdDetector(private val service: AccessibilityService) {
             AdActionType.SWIPE_RIGHT -> swipe(horizontal = true, toRight = true)
             AdActionType.BACK -> service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
         }
+    }
+
+    /**
+     * 拒绝“整屏级”点击目标：面积 ≥ 屏幕 60% 的可点击节点几乎都是**广告创意 / 整页容器**，
+     * 点它等于“点进广告落地页/直播间”，而不是点按钮。
+     * （2026-10-23：用户反馈某些直播类广告会“过几秒点进去”。）
+     */
+    private fun isOversizedClickTarget(node: AccessibilityNodeInfo): Boolean {
+        val dm = service.resources.displayMetrics
+        val screenArea = dm.widthPixels.toLong() * dm.heightPixels
+        if (screenArea <= 0) return false
+        val r = Rect()
+        try {
+            node.getBoundsInScreen(r)
+        } catch (_: Throwable) {
+            return false
+        }
+        if (r.isEmpty) return false
+        val area = r.width().toLong() * r.height()
+        if (area * 100 < screenArea * 60) return false
+        Log.w(TAG, "拒绝点击：目标覆盖 ${area * 100 / screenArea}% 屏幕（疑似广告创意/容器），避免点进落地页")
+        return true
     }
 
     private fun swipe(up: Boolean = true, horizontal: Boolean = false, toRight: Boolean = true): Boolean {

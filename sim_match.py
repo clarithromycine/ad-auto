@@ -223,9 +223,38 @@ print('hasCountdown =', has_countdown, '| hasAdContext =', has_ad_context)
 def matches(n, kw):
     return kw in n.text or kw in n.desc
 
+# ---------- 2026-10-23 倒计时广告：优先点“跳过/关闭”（对应 AdRules.match 的 0.5 分支） ----------
+UPCOMING_AD_KEYWORDS = ["进入广告", "播放广告", "广告即将", "即将播放广告", "即将进入广告",
+                       "后进入广告", "后播放广告", "开始播放广告", "即将开始播放", "即将开始广告"]
+has_upcoming_ad = any(k in pageText or k in compactText for k in UPCOMING_AD_KEYWORDS)
+countdown_click = None
+if has_countdown and not has_upcoming_ad and not has_pc:
+    for _name, _texts, _req_ctx, _req_cd in CLICK_RULES:
+        if _req_cd:
+            continue
+        if _req_ctx and not has_ad_context:
+            continue
+        for _n in nodes:
+            for _kw in _texts:
+                if _kw and (_kw in _n.text or _kw in _n.desc):
+                    _c = find_clickable_parents(_n)
+                    if _c is not None:
+                        countdown_click = (_name, _n, _c)
+                        break
+            if countdown_click:
+                break
+        if countdown_click:
+            break
 print()
-print('=== FINAL DECISION (order: swipe-up > playback-protection > render-view > shop-card > click rules) ===')
-if swipe_hits:
+print('=== 倒计时广告优先点跳过/关闭 ===')
+print('countdown skip-click =', '(none)' if countdown_click is None
+      else '%r on %s' % (countdown_click[0], countdown_click[2].bounds))
+
+print()
+print('=== FINAL DECISION (order: countdown-skip-click > swipe-up > playback-protection > render-view > shop-card > click rules) ===')
+if countdown_click is not None:
+    print('>>> ACTION: CLICK (%s(倒计时中优先)) node_text=%r' % (countdown_click[0], countdown_click[1].text[:20]))
+elif swipe_hits:
     print('>>> ACTION: SWIPE_UP (上滑继续观看) — explicit swipe-up prompt, overrides playback protection')
 elif has_pc:
     print('>>> ACTION: none — playback controls present (正剧保护)')

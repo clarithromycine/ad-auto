@@ -356,6 +356,26 @@ object AdRules {
         // 红果专属判据闸门（见 HONGUO_PACKAGE 注释）
         val isHonguo = pkg == HONGUO_PACKAGE
 
+        // 0.5) 倒计时广告：**优先点“跳过 / 关闭”**，而不是傻等倒计时结束（2026-10-23 用户反馈）。
+        //   典型 Pangle 广告同时挂着“跳过 5s”按钮和“上滑继续观看”提示。旧顺序里上滑判定在前，
+        //   而倒计时期间滑动是被锁住的 → 只能干等到倒计时归零（用户感知就是“不该等这 5 秒”）。
+        //   这里先尝试点带“跳过/关闭”文字的按钮（仍需广告上下文，规则见 CLICK_RULES），
+        //   点不到再走后面的上滑 / 等倒计时逻辑。正剧与“即将进入广告”前置提示一律不参与。
+        if (hasCountdown(pageText) && !hasUpcomingAd(pageText) && !hasPlaybackControls(pageText)) {
+            for (rule in CLICK_RULES) {
+                if (rule.requireCountdown) continue // “继续观看”类必须等倒计时结束才点
+                for (node in nodes) {
+                    if (!node.matchesAny(rule.texts)) continue
+                    val clickable = findClickable(node) ?: continue
+                    return AdAction(
+                        AdActionType.CLICK,
+                        clickable,
+                        reason = rule.name + "(倒计时中优先)",
+                    )
+                }
+            }
+        }
+
         // 1) “上滑继续观看短剧”类广告 -> 上滑。
         //    这类提示词带明确方向（上滑），是硬性广告信号，正常播放时绝不会出现，
         //    因此放在“正剧保护”之前判定——避免广告文案里偶然出现的“展开”等正剧词
