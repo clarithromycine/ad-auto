@@ -48,6 +48,11 @@ print('>>> in scope (generic mode OR supported package), continuing analysis')
 HONGUO_PACKAGE = 'com.phoenix.read'
 IS_HONGUO = (dump_pkg == HONGUO_PACKAGE)
 
+# 屏幕尺寸 / 方向（提前算，后续多条判据要用）
+_m = re.search(r'bounds="\[0,0\]\[(\d+),(\d+)\]"', xml)
+SCREEN_W, SCREEN_H = (int(_m.group(1)), int(_m.group(2))) if _m else (0, 0)
+IS_PORTRAIT = 0 < SCREEN_W < SCREEN_H
+
 class Node:
     __slots__ = ('text', 'desc', 'cls', 'clickable', 'pkg', 'bounds', 'rid', 'children')
     def __init__(self, text, desc, cls, clickable, pkg, bounds, rid, children):
@@ -188,8 +193,6 @@ for k in PLAYBACK_CONTROL_KEYWORDS:
 # 横屏正剧实测 nodes=22 textLen=0，与广告撞车 -> 仅竖屏生效。
 SPARSE_AD_MAX_NODES = 40
 SPARSE_AD_MAX_TEXT_LEN = 30
-_m = re.search(r'bounds="\[0,0\]\[(\d+),(\d+)\]"', xml)
-SCREEN_W, SCREEN_H = (int(_m.group(1)), int(_m.group(2))) if _m else (0, 0)
 looks_sparse = (
     SCREEN_W > 0 and SCREEN_H > 0 and SCREEN_W < SCREEN_H
     and len(nodes) <= SPARSE_AD_MAX_NODES
@@ -262,7 +265,7 @@ elif IS_HONGUO and shop_card:
     print('>>> ACTION: SWIPE_UP (穿山甲广告(商城卡片))')
 elif IS_HONGUO and has_render_view:
     print('>>> ACTION: SWIPE_UP (直播广告(渲染视图))')
-elif IS_HONGUO and has_render_surface:
+elif IS_HONGUO and IS_PORTRAIT and has_render_surface:
     print('>>> ACTION: SWIPE_UP (广告(渲染视图TextureView))')
 elif IS_HONGUO and has_ad_item:
     print('>>> ACTION: SWIPE_UP (广告(广告布局容器))')

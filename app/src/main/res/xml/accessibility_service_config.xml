@@ -4,6 +4,8 @@
   flagIncludeNotImportantViews：**必须**带上——广告 SDK 会把广告浮层（含直播广告的渲染视图）
   标记成“对无障碍不重要”，不带这个 flag 我们的节点树里根本看不到它们
   （uiautomator 之所以能看到，是因为它默认带了这个 flag）。
+  canTakeScreenshot：横屏（全屏）时正剧控件会被隐藏，节点树分不出广告/正剧，
+  需要用截图 + 颜色统计判断“是否存在明显的橙色按钮”（API 30+，不需要 OCR）。
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
@@ -11,6 +13,7 @@
     android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
     android:description="@string/accessibility_service_desc"
     android:notificationTimeout="100"
     android:settingsActivity="com.wisight.adauto.MainActivity" />

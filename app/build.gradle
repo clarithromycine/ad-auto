@@ -3,7 +3,7 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// 读取本地签名配置（keystore.properties，已被 git 忽略）
+// 璇诲彇鏈湴绛惧悕閰嶇疆锛坘eystore.properties锛屽凡琚?git 蹇界暐锛?
 def keystorePropertiesFile = rootProject.file("keystore.properties")
 def keystoreProperties = new Properties()
 if (keystorePropertiesFile.exists()) {
@@ -18,8 +18,8 @@ android {
         applicationId "com.wisight.adauto"
         minSdk 26
         targetSdk 34
-        versionCode 9
-        versionName "1.0.9"
+        versionCode 16
+        versionName "1.0.16"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -51,7 +51,7 @@ android {
         viewBinding true
     }
     lint {
-        // 避免 release 构建时触发 lintVital 联网下载检查（发布前可在本地单独执行 lint）
+        // 閬垮厤 release 鏋勫缓鏃惰Е鍙?lintVital 鑱旂綉涓嬭浇妫€鏌ワ紙鍙戝竷鍓嶅彲鍦ㄦ湰鍦板崟鐙墽琛?lint锛?
         checkReleaseBuilds false
     }
 }

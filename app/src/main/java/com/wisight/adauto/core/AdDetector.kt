@@ -2,15 +2,21 @@ package com.wisight.adauto.core
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorSpace
 import android.graphics.Path
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import java.util.concurrent.Executors
 
 /**
  * 广告检测器：遍历当前屏幕上各窗口的节点树，按 AdRules 匹配并执行跳过动作。
@@ -70,6 +76,125 @@ class AdDetector(private val service: AccessibilityService) {
          * 因此要求该状态连续满足至少这么久才动手，避免把正剧划走。
          */
         private const val AD_ITEM_CONFIRM_MS = 800L
+
+        /**
+         * 横屏“橙色按钮”视觉兜底（截图 + 颜色统计，不做 OCR）。
+         * 用于横屏全屏时正剧控件被隐藏、节点树分不出广告/正剧的情况
+         * （实测横屏广告的无障碍树：50 节点 / 0 文字，连“上滑继续看剧集”都读不到）。
+         *
+         * 判据不是“橙色像素占比”（实测正剧画面反而更高：横屏正剧 9.8% > 广告 7.2%），
+         * 而是“能不能看到一个实心橙色宽条”，即最大橙色连通块要：
+         * - 填充率高（实心按钮 vs 画面里散的橙色物体）
+         * - 够宽、够矮、宽高比大（横条按钮）
+         * - 位置在中下部（不在顶部标题区）
+         * 实测：“查看详情”按钮 = 2082x108、填充率 0.97；横屏正剧最大块 = 336x360、填充率 0.40。
+         */
+        private const val ORANGE_SAMPLE_STEP = 4
+        /** 连通块填充率下限（实心按钮） */
+        private const val ORANGE_FILL_MIN = 0.80f
+        /** 宽度至少占屏宽的比例 */
+        private const val ORANGE_MIN_WIDTH_FRAC = 0.25f
+        /** 高度绝对下限（像素） */
+        private const val ORANGE_MIN_HEIGHT_PX = 20
+        /** 高度上限占屏高比例（再高就不是按钮了，是整块画面） */
+        private const val ORANGE_MAX_HEIGHT_FRAC = 0.30f
+        /** 宽高比下限（横条） */
+        private const val ORANGE_MIN_ASPECT = 2.5f
+        /** 连通块中心 Y 至少在这个比例以下（避让顶部标题/角标） */
+        private const val ORANGE_MIN_CENTER_Y_FRAC = 0.30f
+
+        /**
+         * 形态 B：**右下角的小实心橙色按钮**（2026-10-27 新增）。
+         * 实测样本：横屏直播/电商广告右下角「查看详情」CTA = `216x84`（屏 2670x1200，
+         * 即宽 8.1% / 高 7.0%）、填充 0.82、中心X 0.85、中心Y 0.92 ——
+         * 宽度远不到形态 A 的 25% 屏宽门槛，且**不是画面里最大的橙色块**
+         * （最大的那块是 224x132 填充 0.56 的零碎橙色，会把它盖掉），
+         * 所以必须逐块判定 + 单独一套几何约束。
+         * 对照横屏正剧（同机实测）：右下角区域最大块 200x124 填充 0.61、中心X 0.42 → 不命中。
+         */
+        private const val ORANGE_CTA_FILL_MIN = 0.75f
+        private const val ORANGE_CTA_MIN_WIDTH_FRAC = 0.05f
+        private const val ORANGE_CTA_MAX_WIDTH_FRAC = 0.20f
+        private const val ORANGE_CTA_MIN_HEIGHT_FRAC = 0.03f
+        private const val ORANGE_CTA_MAX_HEIGHT_FRAC = 0.15f
+        /** 中心 X 在屏幕右侧（≥ 该比例） */
+        private const val ORANGE_CTA_MIN_CENTER_X_FRAC = 0.75f
+        /** 中心 Y 在屏幕底部（≥ 该比例） */
+        private const val ORANGE_CTA_MIN_CENTER_Y_FRAC = 0.80f
+        /** 小于该格数的连通块视为噪点，不参与判定 */
+        private const val ORANGE_MIN_CELLS = 4
+        /**
+         * **颜色纯度**判据（2026-10-27 用户提出）：“短剧画面里的橙色块不会是一个色值，
+         * 但按钮色块一定是同一个色值”。把橙块内像素相对块内均值的偏离限定在 ±该值内，
+         * 再统计带内占比。实测（步长 4px、屏幕 2670x1200）:
+         * - 广告右下角 CTA：均值 #EF8E3E，最大标准差 6.9，±12 带内占比 **0.98**
+         * - 广告里的视频橙块：均值 #BD8953，标准差 17.8，带内占比 **0.38**
+         * - 正剧里的橙块：均值 #A1744F，标准差 12.8，带内占比最高 **0.76**
+         * 所以纯度是比“形状/填充率”分离度大得多的判据。
+         */
+        private const val ORANGE_COLOR_TOL = 12
+        /** 纯度下限：低于它就不叫“按钮”而是画面里的同色系物体 */
+        private const val ORANGE_UNIFORMITY_MIN = 0.85f
+        /**
+         * **近似矩形**判据（2026-10-27 用户提出：“按钮一定是一个近似矩形”）。
+         * 只看填充率不够 —— 斜向色带/L 形/圆弧也能填满外接框一半。矩形要做的是
+         * “每一行的横向跨度都接近外接框宽度，每一列的纵向跨度都接近外接框高度”。
+         * 实测: 广告 CTA 行跨 1.00 / 列跨 0.94；视频橙块行跨 0.00~0.59、列跨 0.26~0.70。
+         */
+        /** 单行/单列的跨度达到外接框该方向尺寸的这个比例，才算“这一行是满的” */
+        private const val ORANGE_RECT_SPAN_FRAC = 0.80f
+        /**
+         * 行/列攠“满”的比例下限。
+         * 实测（**App 内截图像素**，盒平均后）：真广告按钮 行跨 1.00 / 列跨 0.98、
+         * 填充 0.97；正剧块 填充≤0.50、行跨≤0.30、列跨≤0.35 → 分离度极大。
+         * 注意：这两个几何量在 `adb screencap` 与 App `takeScreenshot` 两条路径下
+         * **完全一致**（同一根按钮两边都是填充 0.97 / 行跨 1.00 / 列跨 0.98），
+         * 所以几何是可靠判据，颜色不是（见下方说明）。
+         */
+        private const val ORANGE_RECT_ROW_COVER_MIN = 0.90f
+        private const val ORANGE_RECT_COL_COVER_MIN = 0.88f
+        /** 截图探测最小间隔（系统本身也限制截图频率） */
+        private const val ORANGE_PROBE_INTERVAL_MS = 1_200L
+        /** 截图结果的有效期 */
+        private const val ORANGE_RATIO_FRESH_MS = 2_500L
+        /** 探测后重扫的延迟（等截图回调回来） */
+        private const val ORANGE_RETRY_MS = 1_300L
+        /** 需要两张“不同截图”都命中才判定（避免视频画面偶然偏橙误判） */
+        private const val ORANGE_HITS_REQUIRED = 2
+        /**
+         * 横屏模糊态的**自主轮询**间隔 / 次数上限。
+         * 起因（2026-10-27）：横屏广告的视频层画在 surface 上、叠加文字不再刷新时，
+         * 无障碍**一个事件都没有**；一旦上滑补扫链结束，服务就彻底停摆
+         * （实测现场 logcat 静默 10 分钟以上，广告一直挂在那里不划）。
+         */
+        private const val LANDSCAPE_POLL_MS = 1_500L
+        private const val LANDSCAPE_POLL_MAX = 40
+        /**
+         * 低频看门狗：多久无条件重扫一次（毫秒）。
+         * 上面那条轮询是在 `detectAndAct` **内部** 排的 —— 如果界面连一个无障碍事件都没有
+         * （典型：横屏静止广告，视频画在 surface 上），`detectAndAct` 根本不会被调用，
+         * 轮询也就永远启不动（实测重装后 20s 内日志 0 行）。所以需要这个不依赖事件的定时器。
+         */
+        private const val WATCHDOG_MS = 3_000L
+        /** 距上次检测不足该时长时看门狗不重复扫（避免与事件路径重复工作） */
+        private const val WATCHDOG_MIN_IDLE_MS = 2_500L
+
+        /**
+         * **横屏策略（2026-10-27 实验结论）**：横屏全屏、控件隐藏时，“有一个实心橙色按钮”
+         * 就是最强的正向证据（正剧全屏状态本来就没有任何按钮）—— 它已经从“兜底”升级为主策略。
+         *
+         * 实测结果（真机 2670x1200）：
+         * - 只靠橙色：`2084x108` 宽条 行跨 1.00/列跨 0.98 → `SWIPE_UP (广告(橙色按钮))` 成功；
+         *   `216x88` 右下角 CTA 行跨 1.00/列跨 0.96 → 同样成功。
+         * - 但经历了一次“判据调试期”：几何/颜色阈值未标定好时，单轨策略会让真广告
+         *   挂在屏幕上 **3 分钟以上**（角标判据被忽略）—— 单策略一旦失效就是全失效。
+         * - 角标 `desc="广告"` 比截图判定快 2~3s（同一广告：角标 11:49:50.8 可见、橙色 11:49:53.7 才确认）。
+         *
+         * 所以最终策略：**保留角标快路径 + 橙色作主策略**，只把真正有风险的
+         * “渲染视图”类判据在横屏禁用（SDK 渲染视图可能残留、与正剧共存，
+         * 而横屏读不到文字使得 `hasPlaybackControls` 保护失效）。
+         */
+        private const val LANDSCAPE_IGNORE_RENDER_VIEW = true
 
         /**
          * 悬浮球正在被拖动：拖动期间暂停广告检测，避免检测占用主线程导致拖动卡顿。
@@ -141,6 +266,35 @@ class AdDetector(private val service: AccessibilityService) {
     /** “稀疏树广告”状态的起始时刻：用于持久性确认（0 = 当前不是该状态） */
     private var sparseAdSinceAt = 0L
 
+    /** 截图探测用的单线程执行器（像素统计不能放主线程） */
+    private val probeExecutor = Executors.newSingleThreadExecutor()
+    /** 每次成功测量递增的序号：用于要求“两张不同截图”都命中 */
+    @Volatile private var orangeSeq = 0L
+    /** 本次测量是否看到一个“实心橙色宽条” */
+    @Volatile private var orangeIsButton = false
+    /** 排查用描述（占比 / 外接矩形 / 填充率 / 长宽比） */
+    @Volatile private var orangeInfo = ""
+    /** 本次测量的时刻（0 = 当前无有效结果） */
+    @Volatile private var orangeAt = 0L
+    /** 截图请求是否在飞行中（避免重复请求） */
+    @Volatile private var orangeProbeInFlight = false
+    /** 上次发起截图请求的时刻（节流） */
+    private var lastOrangeProbeAt = 0L
+    /** 已被消费过的测量序号（同一张图不重复计命中） */
+    private var lastCountedOrangeSeq = 0L
+    /** 命中次数（需要两张不同截图都命中） */
+    private var orangeHitCount = 0
+    /** 是否已为当前测量排了“等结果回来再扫一次”的任务 */
+    private var orangeRetryPending = false
+    /** 已打印过日志的测量序号（同一张截图不重复刷日志） */
+    private var lastLoggedOrangeSeq = 0L
+    /** 横屏模糊态剩余可轮询次数（0 = 停止轮询，等待新的无障碍事件） */
+    private var landscapePollLeft = LANDSCAPE_POLL_MAX
+    /** 下一次允许计一次轮询预算的时刻：内容变化事件每秒可来十几次，不加闸门会 4 秒烧完预算 */
+    private var nextLandscapePollAt = 0L
+    /** 上一次真正执行检测的时刻（看门狗据此避让事件路径） */
+    private var lastDetectAt = 0L
+
     /** 结束当前“广告上滑链”（窗口切换 / 锁期等待 / 换广告时调用） */
     private fun resetAdSwipeChain() {
         adSwipeStreak = 0
@@ -172,6 +326,12 @@ class AdDetector(private val service: AccessibilityService) {
             pauseFlowDisabledUntil = 0L
             resetAdSwipeChain()
             sparseAdSinceAt = 0L
+            // 换了窗口（换广告/回正剧）：橙色探测结果与计数作废
+            orangeAt = 0L
+            orangeHitCount = 0
+            orangeRetryPending = false
+            landscapePollLeft = LANDSCAPE_POLL_MAX
+            nextLandscapePollAt = 0L
         }
 
         // 内容变化事件非常频繁，做节流
@@ -203,9 +363,41 @@ class AdDetector(private val service: AccessibilityService) {
         detectAndAct(onResult)
     }
 
+    /**
+     * 启动低频看门狗：不依赖无障碍事件的周期性检测。
+     * 用于“界面完全静止、一个事件都不来”的场景（横屏静止广告最为典型）。
+     * 成本很低：非支持范围内的 App 在包名闸门处就直接返回，不会遍历节点树。
+     */
+    fun startWatchdog() {
+        handler.removeCallbacks(watchdogRunnable)
+        handler.postDelayed(watchdogRunnable, WATCHDOG_MS)
+    }
+
+    fun stopWatchdog() {
+        handler.removeCallbacks(watchdogRunnable)
+    }
+
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            try {
+                if (SettingsManager.adSkipEnabled && !isDragging) {
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastDetectAt >= WATCHDOG_MIN_IDLE_MS) {
+                        detectAndAct(isWindowStateChange = false)
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "看门狗检测异常: $t")
+            } finally {
+                handler.postDelayed(this, WATCHDOG_MS)
+            }
+        }
+    }
+
     private fun detectAndAct(onResult: (String) -> Unit = {}, isWindowStateChange: Boolean = false) {
         // 拖动悬浮球期间暂停检测，保证拖动流畅；结束后由悬浮球补扫一次
         if (isDragging) return
+        lastDetectAt = SystemClock.uptimeMillis()
         // 前台应用包名：先排除我们自己（设置页里含“自动跳过/广告快跳”等文字，会被误判成广告）。
         // 例如在设置页打开开关会触发界面变化事件，若不排除就会点到自己界面上的“跳过”/“关闭”。
         val fgPkg = foregroundPackage()
@@ -249,7 +441,88 @@ class AdDetector(private val service: AccessibilityService) {
                 "sparse=${AdRules.looksLikeSparseAdItem(nodes, pageText, frameW, frameH)} " +
                 "countdown=$countdownFound streak=$adSwipeStreak",
         )
-        val action = AdRules.match(nodes, pageText, frameW, frameH, fgPkg)
+        var action = AdRules.match(nodes, pageText, frameW, frameH, fgPkg)
+        // **横屏策略**：禁用“渲染视图”类判据。广告 SDK 的渲染视图可能残留、与正剧共存，
+        // 而横屏全屏读不到任何文字 → `hasPlaybackControls` 保护失效 → 一旦残留就会误划正剧。
+        // 角标（`desc="广告"`）保留：那是 SDK 自画的广告标签，无猜测成分，且比截图快 2~3s。
+        if (action != null && LANDSCAPE_IGNORE_RENDER_VIEW && frameW > frameH &&
+            fgPkg == AdRules.HONGUO_PACKAGE && action.reason == AdRules.REASON_LIVE_AD
+        ) {
+            Log.d(TAG, "横屏策略：忽略渲染视图判据 ${action.reason}，改由橙色按钮判定")
+            action = null
+        }
+        // 用“画面里是否有一个实心橙色按钮”来区分广告/正剧（截图 + 颜色统计，无 OCR）。
+        // 只在模糊态 & 非动作冷却期才截图；要求**两张不同截图**都命中才动手。
+        val nowOrange = SystemClock.uptimeMillis()
+        // 横屏“分不出来”的状态：正剧控件被隐藏 + 没有任何可用的正向广告特征
+        val landscapeAmbiguous = action == null &&
+            isLandscapeAmbiguous(frameW, frameH, pageText, fgPkg)
+        if (landscapeAmbiguous && nowOrange >= nextAllowedAt) {
+            val fresh = orangeAt != 0L && nowOrange - orangeAt <= ORANGE_RATIO_FRESH_MS
+            if (!fresh) {
+                // 还没有可用截图：请求一次，并在结果回来后补扫一次
+                requestOrangeProbe()
+                if (!orangeRetryPending) {
+                    orangeRetryPending = true
+                    scheduleRetry(ORANGE_RETRY_MS, "橙色按钮探测")
+                }
+                recycleAll(nodes)
+                return
+            }
+            // 结果已被消费：允许为下一次测量再排补扫
+            orangeRetryPending = false
+            if (orangeIsButton && orangeSeq != lastCountedOrangeSeq) {
+                lastCountedOrangeSeq = orangeSeq
+                orangeHitCount++
+            } else if (!orangeIsButton) {
+                orangeHitCount = 0
+            }
+            // 同一张截图只记一行日志（content change 每秒可来十几次）
+            if (orangeSeq != lastLoggedOrangeSeq) {
+                lastLoggedOrangeSeq = orangeSeq
+                Log.d(TAG, "横屏主策略：$orangeInfo 命中 $orangeHitCount/$ORANGE_HITS_REQUIRED")
+            }
+            if (orangeHitCount >= ORANGE_HITS_REQUIRED) {
+                orangeHitCount = 0
+                orangeAt = 0L
+                action = AdAction(
+                    AdActionType.SWIPE_UP,
+                    null,
+                    reason = AdRules.REASON_ORANGE_AD,
+                    immediate = true,
+                )
+            } else if (orangeIsButton) {
+                // 命中一次：再取一张新图确认
+                requestOrangeProbe()
+                orangeRetryPending = true
+                scheduleRetry(ORANGE_RETRY_MS, "橙色按钮确认")
+                recycleAll(nodes)
+                return
+            }
+        } else {
+            orangeHitCount = 0
+        }
+        // 静止广告的“续命轮询”（2026-10-27）：横屏广告的视频层画在 surface 上、叠加文字不再刷新时，
+        // 无障碍**一个事件都没有**；一旦上滑补扫链结束，服务就彻底停摆
+        // （实测现场 logcat 静默 10 分钟以上，广告一直挂着不划）。
+        // 所以只要仍处于“分不出来”的模糊态且没有拿到动作，就自己定期再扫一次。
+        // 有次数上限：避免在横屏正剧上无限截图。
+        if (landscapeAmbiguous && action == null && landscapePollLeft > 0 &&
+            nowOrange >= nextLandscapePollAt
+        ) {
+            landscapePollLeft--
+            if (landscapePollLeft == 0) {
+                Log.d(TAG, "横屏主策略轮询 $LANDSCAPE_POLL_MAX 次用尽，停止轮询（等待新的无障碍事件）")
+            }
+            val wait = if (nowOrange < nextAllowedAt) {
+                (nextAllowedAt - nowOrange).coerceAtLeast(200L)
+            } else {
+                LANDSCAPE_POLL_MS
+            }
+            nextLandscapePollAt = nowOrange + wait
+            requestOrangeProbe()
+            scheduleRetry(wait, "横屏主策略轮询(剩 $landscapePollLeft)")
+        }
         // “稀疏树”是缺失型判据：广告→正剧的过渡帧也会满足（实测 nodes=26~28 textLen=0，约 400ms），
         // 所以要求该状态连续观测满 AD_ITEM_CONFIRM_MS 才动手；任何其它状态立即清零。
         if (action?.reason != AdRules.REASON_SPARSE_AD) {
@@ -361,6 +634,9 @@ class AdDetector(private val service: AccessibilityService) {
             }
             nextAllowedAt = now + cooldown
             lastActionAt = now
+            // 已经动作过 = 新的一段广告，横屏主策略轮询预算重置
+            landscapePollLeft = LANDSCAPE_POLL_MAX
+            nextLandscapePollAt = 0L
             // 标记改成纯 ASCII，便于排查时 grep（控制台会把中文转码成乱码）
             val swipeTag = if (adSwipeRetry) {
                 " [retry#${adSwipeStreak + 1} elapsed=${chainElapsed}ms" +
@@ -726,6 +1002,471 @@ class AdDetector(private val service: AccessibilityService) {
         if (area * 100 < screenArea * 60) return false
         Log.w(TAG, "拒绝点击：目标覆盖 ${area * 100 / screenArea}% 屏幕（疑似广告创意/容器），避免点进落地页")
         return true
+    }
+
+    /**
+     * 横屏“模糊态”：拿不到正剧控件、也没有任何正向广告特征 —— 只有这种状态才值得截图看颜色。
+     * 横屏全屏时红果会把正剧控件全部隐藏（实测正剧：43 节点 / 0 文字 / 0 可点击），
+     * 节点树完全分不出广告和正剧。注意：横屏时橙色按钮是**主策略**而不是兜底（见 LANDSCAPE_ORANGE_ONLY）。
+     */
+    private fun isLandscapeAmbiguous(
+        frameW: Int,
+        frameH: Int,
+        pageText: String,
+        fgPkg: String,
+    ): Boolean {
+        if (frameW <= 0 || frameH <= 0 || frameW <= frameH) return false
+        if (fgPkg != AdRules.HONGUO_PACKAGE) return false
+        return !AdRules.hasPlaybackControls(pageText)
+    }
+
+    /**
+     * 请求一次截图并判断“画面里是否有实心橙色宽按钮”（不做 OCR）。
+     * - API < 30 或未声明 `canTakeScreenshot` 时直接返回（不会有结果，规则不生效）；
+     * - 系统对截图有频率限制，这里再做 1.2s 节流 + 飞行中防重入；
+     * - 像素统计放到后台线程（getPixels 按行采样），不占主线程。
+     */
+    private fun requestOrangeProbe() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val now = SystemClock.uptimeMillis()
+        if (orangeProbeInFlight || now - lastOrangeProbeAt < ORANGE_PROBE_INTERVAL_MS) return
+        orangeProbeInFlight = true
+        lastOrangeProbeAt = now
+        try {
+            service.takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                probeExecutor,
+                object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        var isButton = false
+                        var info = "截图解析失败"
+                        try {
+                            val hw = result.hardwareBuffer
+                            val bmp = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
+                            if (bmp != null) {
+                                // 排查色彩管线：缓冲区格式 / 色彩空间 / 位图配置
+                                Log.d(
+                                    TAG,
+                                    "截图缓冲: hw=${hw.width}x${hw.height} fmt=${hw.format} " +
+                                        "layers=${hw.layers} bmpConf=${bmp.config} " +
+                                        "cs=${result.colorSpace?.name} bmpCs=${bmp.colorSpace?.name}",
+                                )
+                                val r = computeOrangeBar(bmp)
+                                isButton = r.first
+                                info = r.second
+                            }
+                            try {
+                                hw.close()
+                            } catch (_: Throwable) {
+                            }
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "橙色探测：解析截图失败 $t")
+                        } finally {
+                            onOrangeResult(isButton, info)
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        Log.w(TAG, "橙色探测：截图失败 code=$errorCode")
+                        onOrangeResult(false, "截图失败 code=$errorCode")
+                    }
+                },
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "橙色探测：调用截图异常 $t")
+            onOrangeResult(false, "调用截图异常")
+        }
+    }
+
+    private fun onOrangeResult(isButton: Boolean, info: String) {
+        orangeIsButton = isButton
+        orangeInfo = info
+        orangeSeq++
+        orangeAt = SystemClock.uptimeMillis()
+        orangeProbeInFlight = false
+    }
+
+    /**
+     * 判断画面里是否有一个“实心橙色宽条”（= 广告 CTA 按钮）。
+     *
+     * 判据不是橙色占比（实测正剧画面占比反而更高），而是最大橙色连通块的几何形状：
+     * 填充率高 + 够宽 + 够矮 + 宽高比大 + 位置在中下部。
+     * 实测：“查看详情”按钮 2082x108、填充率 0.97、长宽比 19 → 命中；
+     * 横屏正剧最大块 336x360、填充率 0.40 → 不命中。
+     *
+     * @return first = 是否判定为按钮，second = 排查用描述
+     */
+    private fun computeOrangeBar(src: Bitmap): Pair<Boolean, String> {
+        // **关键**：无障碍截图返回的是 Display P3（广色域）原始像素，而 adb screencap / 人眼看到的
+        // 是 sRGB。不转色域就直接比色，同一根橙色按钮会显得“颜色很散”（实测 ±12 纯度
+        // 0.68 vs screencap 0.998，均值 #FE8720 vs #EF8E3E）。所以先画到一张 sRGB 位图里。
+        val sw = try {
+            val out = Bitmap.createBitmap(
+                src.width,
+                src.height,
+                Bitmap.Config.ARGB_8888,
+                false,
+                ColorSpace.get(ColorSpace.Named.SRGB),
+            )
+            Canvas(out).drawBitmap(src, 0f, 0f, null)
+            out
+        } catch (t: Throwable) {
+            Log.w(TAG, "转 sRGB 失败，退回原图：$t")
+            try {
+                src.copy(Bitmap.Config.ARGB_8888, false)
+            } catch (t2: Throwable) {
+                null
+            }
+        } ?: return false to "copy bitmap 失败"
+        try {
+            val w = sw.width
+            val h = sw.height
+            if (w <= 0 || h <= 0) return false to "截图尺寸异常"
+            val step = ORANGE_SAMPLE_STEP
+            val gw = (w + step - 1) / step
+            val gh = (h + step - 1) / step
+            val totalCells = gw * gh
+            // 每格存“采样到的颜色”（0 = 非橙色）。存颜色而不是布尔值，是为了能算颜色纯度：
+            // 视频里的“橙色”是几百种色值混在一起，UI 按钮是同一色值。
+            val grid = IntArray(totalCells)
+            val row = IntArray(w)
+            // step×step **盒平均**后再判定：无障碍截图路径（HardwareBuffer → copy）会引入
+            // 逐像素抖动/色域转换差异（实测同一根橙色按钮：screencap 均值 #EF8E3E、App 内均值
+            // #FE8720，通道极差几十），单点采样会让“颜色纯度”判据直接失效。盒平均保留
+            // 视频的渐变（大范围色差），只抹掉逐像素噪声。
+            val accR = IntArray(gw)
+            val accG = IntArray(gw)
+            val accB = IntArray(gw)
+            val accN = IntArray(gw)
+            var orangeCells = 0
+            var gy = 0
+            for (y in 0 until h) {
+                sw.getPixels(row, 0, w, 0, y, w, 1)
+                for (gx in 0 until gw) {
+                    val xs = gx * step
+                    val xe = if (xs + step < w) xs + step else w
+                    var sr = 0
+                    var sg = 0
+                    var sb = 0
+                    for (x in xs until xe) {
+                        val c = row[x]
+                        sr += (c shr 16) and 0xFF
+                        sg += (c shr 8) and 0xFF
+                        sb += c and 0xFF
+                    }
+                    accR[gx] += sr
+                    accG[gx] += sg
+                    accB[gx] += sb
+                    accN[gx] += xe - xs
+                }
+                if ((y + 1) % step == 0 || y == h - 1) {
+                    val base = gy * gw
+                    for (gx in 0 until gw) {
+                        val n = accN[gx]
+                        if (n > 0) {
+                            val r = accR[gx] / n
+                            val g = accG[gx] / n
+                            val b = accB[gx] / n
+                            // 橙色：R 高、B 低、且 R>=G>=B（纯红、纯黄都会被排除）
+                            if (r >= 140 && g in 40..200 && b <= 110 && r - b >= 70 && r >= g && g >= b) {
+                                grid[base + gx] = (r shl 16) or (g shl 8) or b
+                                orangeCells++
+                            }
+                        }
+                        accR[gx] = 0
+                        accG[gx] = 0
+                        accB[gx] = 0
+                        accN[gx] = 0
+                    }
+                    gy++
+                }
+            }
+            val ratioPct = if (totalCells == 0) 0f else orangeCells * 100f / totalCells
+            // 逐块判定（不能只看最大的那块：实测右下角 CTA 会被画面里更大的散碎橙色块盖掉）
+            var bestSize = 0
+            var bestDesc = ""
+            var barHit = false
+            var barDesc = ""
+            var ctaHit = false
+            var ctaDesc = ""
+            if (orangeCells > 0) {
+                val visited = BooleanArray(totalCells)
+                val stack = IntArray(orangeCells)
+                // 当前块的格索引：用于计算块内颜色均值与“纯度”
+                val comp = IntArray(orangeCells)
+                // 行/列跨度统计（用 stamp 避免每块重置整个数组）
+                val rowLo = IntArray(gh)
+                val rowHi = IntArray(gh)
+                val colLo = IntArray(gw)
+                val colHi = IntArray(gw)
+                val rowStamp = IntArray(gh) { -1 }
+                val colStamp = IntArray(gw) { -1 }
+                var compId = 0
+                for (start in 0 until totalCells) {
+                    if (grid[start] == 0 || visited[start]) continue
+                    var sp = 0
+                    stack[sp++] = start
+                    visited[start] = true
+                    var size = 0
+                    var x0 = Int.MAX_VALUE
+                    var y0 = Int.MAX_VALUE
+                    var x1 = -1
+                    var y1 = -1
+                    while (sp > 0) {
+                        val idx = stack[--sp]
+                        comp[size++] = idx
+                        val cx = idx % gw
+                        val cy = idx / gw
+                        if (cx < x0) x0 = cx
+                        if (cx > x1) x1 = cx
+                        if (cy < y0) y0 = cy
+                        if (cy > y1) y1 = cy
+                        if (cx > 0) {
+                            val n = idx - 1
+                            if (grid[n] != 0 && !visited[n]) {
+                                visited[n] = true
+                                stack[sp++] = n
+                            }
+                        }
+                        if (cx < gw - 1) {
+                            val n = idx + 1
+                            if (grid[n] != 0 && !visited[n]) {
+                                visited[n] = true
+                                stack[sp++] = n
+                            }
+                        }
+                        if (cy > 0) {
+                            val n = idx - gw
+                            if (grid[n] != 0 && !visited[n]) {
+                                visited[n] = true
+                                stack[sp++] = n
+                            }
+                        }
+                        if (cy < gh - 1) {
+                            val n = idx + gw
+                            if (grid[n] != 0 && !visited[n]) {
+                                visited[n] = true
+                                stack[sp++] = n
+                            }
+                        }
+                    }
+                    if (size < ORANGE_MIN_CELLS) continue
+                    val bw = (x1 - x0 + 1) * step
+                    val bh = (y1 - y0 + 1) * step
+                    val fill = size.toFloat() / ((x1 - x0 + 1) * (y1 - y0 + 1))
+                    val aspect = bw.toFloat() / bh.toFloat().coerceAtLeast(1f)
+                    val centerYFrac = ((y0 + y1) / 2f * step) / h
+                    val centerXFrac = ((x0 + x1) / 2f * step) / w
+                    // 颜色纯度：块内像素相对块内均值的 ±ORANGE_COLOR_TOL 带内占比。
+                    // 视频里的橙色是一大片混色，UI 按钮是同一色值（标定见常量注释）。
+                    var sumR = 0L
+                    var sumG = 0L
+                    var sumB = 0L
+                    // 诊断用：每通道极值（判断 App 截图是“抖动”还是“渐变”）
+                    var minR = 255
+                    var maxR = 0
+                    var minG = 255
+                    var maxG = 0
+                    var minB = 255
+                    var maxB = 0
+                    for (i in 0 until size) {
+                        val c = grid[comp[i]]
+                        val cr = (c shr 16) and 0xFF
+                        val cg = (c shr 8) and 0xFF
+                        val cb = c and 0xFF
+                        sumR += cr
+                        sumG += cg
+                        sumB += cb
+                        if (cr < minR) minR = cr
+                        if (cr > maxR) maxR = cr
+                        if (cg < minG) minG = cg
+                        if (cg > maxG) maxG = cg
+                        if (cb < minB) minB = cb
+                        if (cb > maxB) maxB = cb
+                    }
+                    val meanR = (sumR / size).toInt()
+                    val meanG = (sumG / size).toInt()
+                    val meanB = (sumB / size).toInt()
+                    var near = 0
+                    for (i in 0 until size) {
+                        val c = grid[comp[i]]
+                        val dr = ((c shr 16) and 0xFF) - meanR
+                        val dg = ((c shr 8) and 0xFF) - meanG
+                        val db = (c and 0xFF) - meanB
+                        if (dr >= -ORANGE_COLOR_TOL && dr <= ORANGE_COLOR_TOL &&
+                            dg >= -ORANGE_COLOR_TOL && dg <= ORANGE_COLOR_TOL &&
+                            db >= -ORANGE_COLOR_TOL && db <= ORANGE_COLOR_TOL
+                        ) {
+                            near++
+                        }
+                    }
+                    val uniformity = near.toFloat() / size
+                    // 备选纯度度量：4bit/通道量化直方图 + ±1 邻域占比。
+                    // 起因（2026-10-27 实测）：同一根橙色按钮，`adb screencap` 测得 ±12 纯度为 0.998，
+                    // 而 App 内 `takeScreenshot` 测得只有 0.69（均值 #FE8720 vs #EF8E3E，通道极差几十），
+                    // 说明两种截图路径的色彩管线不同 → 绝对色值不可比，需要容忍量化误差的度量。
+                    var purityBin = 0f
+                    var binR = 0
+                    var binG = 0
+                    var binB = 0
+                    run {
+                        val hist = IntArray(4096)
+                        for (i in 0 until size) {
+                            val c = grid[comp[i]]
+                            val qr = ((c shr 16) and 0xFF) shr 4
+                            val qg = ((c shr 8) and 0xFF) shr 4
+                            val qb = (c and 0xFF) shr 4
+                            hist[(qr shl 8) or (qg shl 4) or qb]++
+                        }
+                        var bestBin = 0
+                        var bestCnt = 0
+                        for (k in 0 until 4096) {
+                            if (hist[k] > bestCnt) {
+                                bestCnt = hist[k]
+                                bestBin = k
+                            }
+                        }
+                        val br = (bestBin shr 8) and 0xF
+                        val bg = (bestBin shr 4) and 0xF
+                        val bb = bestBin and 0xF
+                        var nearBin = 0
+                        for (dr in -1..1) {
+                            for (dg in -1..1) {
+                                for (db in -1..1) {
+                                    val r2 = br + dr
+                                    val g2 = bg + dg
+                                    val b2 = bb + db
+                                    if (r2 in 0..15 && g2 in 0..15 && b2 in 0..15) {
+                                        nearBin += hist[(r2 shl 8) or (g2 shl 4) or b2]
+                                    }
+                                }
+                            }
+                        }
+                        purityBin = nearBin.toFloat() / size
+                        binR = (br shl 4) or 0x0F
+                        binG = (bg shl 4) or 0x0F
+                        binB = (bb shl 4) or 0x0F
+                    }
+                    // 近似矩形：逐行看横向跨度、逐列看纵向跨度是否接近外接框
+                    compId++
+                    for (i in 0 until size) {
+                        val idx = comp[i]
+                        val cx = idx % gw
+                        val cy = idx / gw
+                        if (rowStamp[cy] != compId) {
+                            rowStamp[cy] = compId
+                            rowLo[cy] = cx
+                            rowHi[cy] = cx
+                        } else {
+                            if (cx < rowLo[cy]) rowLo[cy] = cx
+                            if (cx > rowHi[cy]) rowHi[cy] = cx
+                        }
+                        if (colStamp[cx] != compId) {
+                            colStamp[cx] = compId
+                            colLo[cx] = cy
+                            colHi[cx] = cy
+                        } else {
+                            if (cy < colLo[cx]) colLo[cx] = cy
+                            if (cy > colHi[cx]) colHi[cx] = cy
+                        }
+                    }
+                    val rowSpanNeed = ((x1 - x0 + 1) * ORANGE_RECT_SPAN_FRAC).toInt()
+                    val colSpanNeed = ((y1 - y0 + 1) * ORANGE_RECT_SPAN_FRAC).toInt()
+                    var rowsTotal = 0
+                    var rowsOk = 0
+                    for (cy in y0..y1) {
+                        if (rowStamp[cy] != compId) continue
+                        rowsTotal++
+                        if (rowHi[cy] - rowLo[cy] + 1 >= rowSpanNeed) rowsOk++
+                    }
+                    var colsTotal = 0
+                    var colsOk = 0
+                    for (cx in x0..x1) {
+                        if (colStamp[cx] != compId) continue
+                        colsTotal++
+                        if (colHi[cx] - colLo[cx] + 1 >= colSpanNeed) colsOk++
+                    }
+                    val rowCover = if (rowsTotal == 0) 0f else rowsOk.toFloat() / rowsTotal
+                    val colCover = if (colsTotal == 0) 0f else colsOk.toFloat() / colsTotal
+                    val isBarShape = fill >= ORANGE_FILL_MIN &&
+                        bw >= w * ORANGE_MIN_WIDTH_FRAC &&
+                        bh >= ORANGE_MIN_HEIGHT_PX &&
+                        bh <= h * ORANGE_MAX_HEIGHT_FRAC &&
+                        aspect >= ORANGE_MIN_ASPECT &&
+                        centerYFrac >= ORANGE_MIN_CENTER_Y_FRAC
+                    val isCtaShape = fill >= ORANGE_CTA_FILL_MIN &&
+                        bw >= w * ORANGE_CTA_MIN_WIDTH_FRAC &&
+                        bw <= w * ORANGE_CTA_MAX_WIDTH_FRAC &&
+                        bh >= h * ORANGE_CTA_MIN_HEIGHT_FRAC &&
+                        bh <= h * ORANGE_CTA_MAX_HEIGHT_FRAC &&
+                        centerXFrac >= ORANGE_CTA_MIN_CENTER_X_FRAC &&
+                        centerYFrac >= ORANGE_CTA_MIN_CENTER_Y_FRAC
+                    // 形态通过时采样块中线色值：判断变化是“渐变”（单调）还是“抖动”（随机）
+                    var lineDesc = ""
+                    if (isBarShape || isCtaShape) {
+                        val midY = (y0 + y1) / 2
+                        val sb = StringBuilder()
+                        var shown = 0
+                        var seenOnRow = 0
+                        for (i in 0 until size) {
+                            val idx = comp[i]
+                            if (idx / gw != midY) continue
+                            if (seenOnRow % 12 == 0) {
+                                sb.append(String.format(" #%06X", grid[idx]))
+                                shown++
+                            }
+                            seenOnRow++
+                            if (shown >= 8) break
+                        }
+                        lineDesc = sb.toString()
+                    }
+                    val desc = "块 ${bw}x$bh " +
+                        "填充 ${String.format("%.2f", fill)} " +
+                        "长宽比 ${String.format("%.1f", aspect)} " +
+                        "中心X ${String.format("%.2f", centerXFrac)} " +
+                        "中心Y ${String.format("%.2f", centerYFrac)} " +
+                        "纯度 ${String.format("%.2f", uniformity)} " +
+                        "纯度4bit ${String.format("%.2f", purityBin)} " +
+                        "行跨 ${String.format("%.2f", rowCover)} " +
+                        "列跨 ${String.format("%.2f", colCover)} " +
+                        "范围 R$minR-$maxR G$minG-$maxG B$minB-$maxB " +
+                        "色 #${String.format("%02X%02X%02X", meanR, meanG, meanB)} " +
+                        "桶 #${String.format("%02X%02X%02X", binR, binG, binB)}" +
+                        (if (lineDesc.isEmpty()) "" else " 中线:$lineDesc")
+                    if (size > bestSize) {
+                        bestSize = size
+                        bestDesc = desc
+                    }
+                    // 判定：**几何为主**（填充 + 行列跨度）。
+                    // 颜色纯度不用作判据 —— 实测同一根橙色按钮，`adb screencap` 测得 ±12 纯度 0.998、
+                    // App 内只有 0.68（正剧块反而有 0.38~0.47），因为无障碍截图的色彩管线不同。
+                    // 纯度/颜色/极差/4bit桶 仅作排查日志。
+                    val uniform = rowCover >= ORANGE_RECT_ROW_COVER_MIN &&
+                        colCover >= ORANGE_RECT_COL_COVER_MIN
+                    // 形态 A：横贯屏幕的实心橙色宽条（旧版“查看详情”按钮）
+                    if (!barHit && uniform && isBarShape) {
+                        barHit = true
+                        barDesc = desc
+                    }
+                    // 形态 B：右下角的小实心橙色按钮（直播/电商广告的角标 CTA）
+                    if (!ctaHit && uniform && isCtaShape) {
+                        ctaHit = true
+                        ctaDesc = desc
+                    }
+                }
+            }
+            if (bestSize == 0) {
+                return false to "橙色 ${String.format("%.2f", ratioPct)}% 无连通块(≥$ORANGE_MIN_CELLS 格)"
+            }
+            val info = "橙色 ${String.format("%.2f", ratioPct)}% " + when {
+                barHit -> "宽条 $barDesc"
+                ctaHit -> "右下角按钮 $ctaDesc"
+                else -> "最大 $bestDesc"
+            }
+            return (barHit || ctaHit) to info
+        } finally {
+            sw.recycle()
+        }
     }
 
     private fun swipe(up: Boolean = true, horizontal: Boolean = false, toRight: Boolean = true): Boolean {

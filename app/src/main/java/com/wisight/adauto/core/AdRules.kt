@@ -141,6 +141,16 @@ object AdRules {
     const val REASON_SPARSE_AD = "广告(稀疏树)"
 
     /**
+     * “横屏橙色按钮”的判定原因。
+     *
+     * 横屏（全屏）时红果会把正剧控件全部隐藏，节点树里既没有正剧特征也没有广告特征
+     * （实测正剧：43 节点 / 0 文字 / 0 可点击 / 有 SurfaceView）。
+     * 这时改用**截图 + 颜色统计**判断画面里是否存在一个明显的橙色按钮（广告 CTA），
+     * 由 AdDetector 负责截图与判定（见 `probeOrangeButton`），规则这里只提供原因常量。
+     */
+    const val REASON_ORANGE_AD = "广告(橙色按钮)"
+
+    /**
      * **名称无关**的“广告 item”兜底判据（2026-10-23 用户提出：节点/id 数差异明显）。
      *
      * 条件（全部满足）：
@@ -355,6 +365,8 @@ object AdRules {
         val compactText = pageText.replace(Regex("\\s+"), "")
         // 红果专属判据闸门（见 HONGUO_PACKAGE 注释）
         val isHonguo = pkg == HONGUO_PACKAGE
+        // 是否竖屏：部分“结构型”判据在横屏不可靠（正剧全屏时 UI 全隐藏，且视频层可能变成 TextureView）
+        val isPortrait = screenW in 1 until screenH
 
         // 0.5) 倒计时广告：**优先点“跳过 / 关闭”**，而不是傻等倒计时结束（2026-10-23 用户反馈）。
         //   典型 Pangle 广告同时挂着“跳过 5s”按钮和“上滑继续观看”提示。旧顺序里上滑判定在前，
@@ -419,7 +431,10 @@ object AdRules {
         //    无可点节点、无角标/倒计时/具名 id，且上一条（具名 id）认不出来。
         //    实测：正剧始终走 android.view.SurfaceView、不会出现 TextureView；
         //    且本分支位于正剧保护（hasPlaybackControls）之后，双重保险。
-        if (isHonguo && hasAdRenderSurface(nodes)) {
+        //   ⚠️ 2026-10-27 修正——**仅限竖屏**：横屏全屏时正剧的视频层**有时就是 TextureView**
+        //   （同一台设备先后采到 `surface=YES texture=no` 与 `surface=no texture=YES` 两种正剧状态），
+        //   因此“出现 TextureView”在横屏不是广告特征；不过闸门会把正剧当广告连划。
+        if (isHonguo && isPortrait && hasAdRenderSurface(nodes)) {
             val surface = nodes.firstOrNull {
                 it.className?.toString()?.contains(AD_RENDER_VIEW_CLASS) == true
             }

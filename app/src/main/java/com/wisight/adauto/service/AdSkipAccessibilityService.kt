@@ -23,6 +23,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         detector = AdDetector(this)
+        // 不依赖无障碍事件的周期性检测：横屏静止广告可能一个事件都不发，
+        // 没有这个看门狗服务就会彻底停摆（实测 logcat 静默 10 分钟以上）。
+        detector?.startWatchdog()
         // 拉起悬浮球服务（悬浮球关闭时球体是透明的，但服务仍然要跑）：
         // 没有前台服务时 App 在后台会被 MIUI/HyperOS 挂起 → 收不到无障碍事件 → 不跳广告。
         if (SettingsManager.ballEnabled || SettingsManager.adSkipEnabled) {
@@ -52,6 +55,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        detector?.stopWatchdog()
         instance = null
         super.onDestroy()
     }
