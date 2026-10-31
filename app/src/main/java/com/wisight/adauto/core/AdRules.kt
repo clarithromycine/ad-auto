@@ -155,23 +155,36 @@ object AdRules {
      *
      * 条件（全部满足）：
      * - **仅竖屏**：[screenW] < [screenH]。横屏正剧实测 `nodes=22 textLen=0`，与广告特征完全撞车；
-     * - 收集节点数 ≤ [SPARSE_AD_MAX_NODES]（正剧 88~90；广告实测 20~24）；
+     * - **过滤前的可见节点数** ≤ [SPARSE_AD_MAX_NODES]（正剧 88~90；广告实测 20~24）；
      * - 文字总量 ≤ [SPARSE_AD_MAX_TEXT_LEN] 字符（正剧 108~124；广告 0~15）；
+     * - 页面存在**视频表面**（SurfaceView/TextureView）：广告创意画在视频层上；
      * - 没有正剧播放控件（[hasPlaybackControls]）。
+     *
+     * ⚠️ 节点数必须用**过滤前**的原始可见节点数：`AdDetector.collectNodes` 只保留带文字 /
+     * 内容描述 / 资源 id / TextureView 的节点，红果“新剧推荐”这类纯自绘列表页（98 个原始节点、
+     * 0 文字）会被压到 4~6 个节点，用过滤后的数量会把正常浏览页误判成广告（2026-10-31 实测）。
+     * 阈值 40 本身就是按原始节点数标定的，两者口径必须一致。
      *
      * ⚠️ 这是“缺失型”判据：**广告 → 正剧的过渡帧**（实测 `nodes=26~28 textLen=0`，持续约 400ms）
      * 同样满足，所以调用方必须做**持久性确认**：AdDetector 里连续观测满
      * `AD_ITEM_CONFIRM_MS`（800ms）才动手，且动作后清零重新确认。
+     *
+     * @param rawVisibleNodeCount 过滤前的可见节点数；传负数时退回 [nodes] 的数量（仅兼容旧调用）。
+     * @param hasVideoSurface 页面是否有 SurfaceView/TextureView；纯图片列表页没有视频表面，直接排除。
      */
     fun looksLikeSparseAdItem(
         nodes: List<AccessibilityNodeInfo>,
         pageText: String,
         screenW: Int,
         screenH: Int,
+        rawVisibleNodeCount: Int = -1,
+        hasVideoSurface: Boolean = false,
     ): Boolean {
         if (screenW <= 0 || screenH <= 0 || screenW >= screenH) return false
-        if (nodes.size > SPARSE_AD_MAX_NODES) return false
+        val nodeCount = if (rawVisibleNodeCount >= 0) rawVisibleNodeCount else nodes.size
+        if (nodeCount > SPARSE_AD_MAX_NODES) return false
         if (pageText.length > SPARSE_AD_MAX_TEXT_LEN) return false
+        if (!hasVideoSurface) return false
         return !hasPlaybackControls(pageText)
     }
 
@@ -353,6 +366,8 @@ object AdRules {
      *        特征做位置过滤；为 0 时跳过位置过滤（向后兼容直接调用）。
      * @param pkg 当前前台包名。红果专属判据只对 [HONGUO_PACKAGE] 生效；
      *        传空（或不匹配）时这些判据全部跳过，只保留通用规则。
+     * @param rawVisibleNodeCount 过滤前的可见节点数（见 [looksLikeSparseAdItem]）。
+     * @param hasVideoSurface 页面是否存在 SurfaceView/TextureView（见 [looksLikeSparseAdItem]）。
      */
     fun match(
         nodes: List<AccessibilityNodeInfo>,
@@ -360,6 +375,8 @@ object AdRules {
         screenW: Int = 0,
         screenH: Int = 0,
         pkg: String = "",
+        rawVisibleNodeCount: Int = -1,
+        hasVideoSurface: Boolean = false,
     ): AdAction? {
         // 去掉空白后做匹配，兼容“上滑 继续看短剧”这类带空格写法
         val compactText = pageText.replace(Regex("\\s+"), "")
@@ -541,7 +558,10 @@ object AdRules {
         //     不依赖任何具体的 id 名或创意文案。安全性见 looksLikeSparseAdItem 注释。
         //     ⚠️ 仅对红果生效：这是缺失型判据，用在别的 App 上会把“Canvas/Surface 画正文”
         //     的页面（如读书软件）当成广告一直划（实测反馈）。
-        if (isHonguo && looksLikeSparseAdItem(nodes, pageText, screenW, screenH)) {
+        if (isHonguo && looksLikeSparseAdItem(
+                nodes, pageText, screenW, screenH, rawVisibleNodeCount, hasVideoSurface,
+            )
+        ) {
             return AdAction(
                 AdActionType.SWIPE_UP,
                 null,

@@ -469,7 +469,8 @@ class AdDetector(private val service: AccessibilityService) {
         }
 
         val nodes = ArrayList<AccessibilityNodeInfo>()
-        collectFromAllWindows(nodes, fgPkg)
+        val stats = NodeStats()
+        collectFromAllWindows(nodes, fgPkg, stats)
         if (nodes.isEmpty()) {
             onResult("无障碍服务尚未就绪")
             return
@@ -486,15 +487,22 @@ class AdDetector(private val service: AccessibilityService) {
         // 排查用：本次到底看到了什么（节点数 / 文字长度 / 各渲染视图 / 是否像“稀疏树广告”）
         Log.d(
             TAG,
-            "scan: fg=$fgPkg nodes=${nodes.size} textLen=${pageText.length} " +
-                "frame=${frameW}x$frameH " +
+            "scan: fg=$fgPkg nodes=${nodes.size} rawNodes=${stats.visibleNodeCount} " +
+                "textLen=${pageText.length} frame=${frameW}x$frameH " +
+                "surface=${stats.hasVideoSurface} " +
                 "renderView=${AdRules.hasAdRenderView(nodes)} " +
                 "texView=${AdRules.hasAdRenderSurface(nodes)} " +
                 "adItem=${AdRules.hasAdItemContainer(nodes)} " +
-                "sparse=${AdRules.looksLikeSparseAdItem(nodes, pageText, frameW, frameH)} " +
+                "sparse=${AdRules.looksLikeSparseAdItem(
+                    nodes, pageText, frameW, frameH,
+                    stats.visibleNodeCount, stats.hasVideoSurface,
+                )} " +
                 "countdown=$countdownFound streak=$adSwipeStreak",
         )
-        var action = AdRules.match(nodes, pageText, frameW, frameH, fgPkg)
+        var action = AdRules.match(
+            nodes, pageText, frameW, frameH, fgPkg,
+            stats.visibleNodeCount, stats.hasVideoSurface,
+        )
         // **横屏策略（2026-10-31 修正）**：1.0.16 曾在这里无条件丢弃“渲染视图”判据，
         // 结果在小米平板 5 上翻车：实测那条直播样式的广告 `renderView=true adItem=true`，
         // 而 `AdRules.match` 只返回**第一个**命中的分支（渲染视图），丢弃后不会继续去试
@@ -602,7 +610,8 @@ class AdDetector(private val service: AccessibilityService) {
             if (held < AD_ITEM_CONFIRM_MS) {
                 Log.d(
                     TAG,
-                    "疑似广告(稀疏树 nodes=${nodes.size} textLen=${pageText.length}) 已持续 ${held}ms，" +
+                    "疑似广告(稀疏树 rawNodes=${stats.visibleNodeCount} textLen=${pageText.length} " +
+                        "surface=${stats.hasVideoSurface}) 已持续 ${held}ms，" +
                         "${AD_ITEM_CONFIRM_MS - held}ms 后确认",
                 )
                 scheduleRetry((AD_ITEM_CONFIRM_MS - held).coerceAtLeast(50L), "稀疏树确认")
@@ -1593,7 +1602,22 @@ class AdDetector(private val service: AccessibilityService) {
         return service.dispatchGesture(gesture, null, null)
     }
 
-    private fun collectNodes(root: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
+    /**
+     * 一次节点遍历的统计信息。
+     * - [visibleNodeCount]：**过滤前**的可见节点数（“稀疏树”判据必须用这个口径，见 AdRules）；
+     * - [hasVideoSurface]：页面是否挂了视频表面（SurfaceView/TextureView）。
+     *   它们通常没有 id/文字，会被 [collectNodes] 丢弃，所以只能在遍历时额外记录。
+     */
+    private class NodeStats {
+        var visibleNodeCount = 0
+        var hasVideoSurface = false
+    }
+
+    private fun collectNodes(
+        root: AccessibilityNodeInfo,
+        out: MutableList<AccessibilityNodeInfo>,
+        stats: NodeStats,
+    ) {
         val stack = ArrayDeque<AccessibilityNodeInfo>()
         stack.add(root)
         while (stack.isNotEmpty()) {
@@ -1601,6 +1625,11 @@ class AdDetector(private val service: AccessibilityService) {
             if (isDragging) return
             val node = stack.removeLast()
             if (!node.isVisibleToUser) continue
+            stats.visibleNodeCount++
+            val cls = node.className?.toString().orEmpty()
+            if (cls.contains("SurfaceView") || cls.contains("TextureView")) {
+                stats.hasVideoSurface = true
+            }
             // 只保留“带文字/内容描述”或“带资源 id”的节点，可大幅减少节点数与主线程开销（拖动悬浮球更跟手）。
             // 必须额外保留带资源 id 的节点：直播样式广告的渲染视图（TextureView
             // `ttlive_player_render_view`）没有任何文字，只能靠资源 id 识别（见 AdRules.hasAdRenderView）。
@@ -1625,7 +1654,11 @@ class AdDetector(private val service: AccessibilityService) {
      * 2) 与前台应用同包名的窗口（同应用内的弹窗/WebView 浮层）
      * 丢弃后台应用/系统设置窗口里残留的广告文字，避免在非播放场景误触发滑动/点击。
      */
-    private fun collectFromAllWindows(out: MutableList<AccessibilityNodeInfo>, fgPkg: String) {
+    private fun collectFromAllWindows(
+        out: MutableList<AccessibilityNodeInfo>,
+        fgPkg: String,
+        stats: NodeStats,
+    ) {
         val windows = try {
             service.windows
         } catch (_: Throwable) {
@@ -1640,11 +1673,11 @@ class AdDetector(private val service: AccessibilityService) {
             // 跳过系统界面/自身窗口：通知栏里会出现我们的通知文案，避免误判成广告点击
             if (pkg in NON_AD_PACKAGES) continue
             if (!win.isActive && pkg != fgPkg) continue
-            collectNodes(root, out)
+            collectNodes(root, out, stats)
         }
         // 兜底：某些设备上 windows 列表为空时退回活动窗口
         if (out.isEmpty()) {
-            service.rootInActiveWindow?.let { collectNodes(it, out) }
+            service.rootInActiveWindow?.let { collectNodes(it, out, stats) }
         }
     }
 
