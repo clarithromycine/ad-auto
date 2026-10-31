@@ -489,19 +489,19 @@ class AdDetector(private val service: AccessibilityService) {
             TAG,
             "scan: fg=$fgPkg nodes=${nodes.size} rawNodes=${stats.visibleNodeCount} " +
                 "textLen=${pageText.length} frame=${frameW}x$frameH " +
-                "surface=${stats.hasVideoSurface} " +
+                "surface=${stats.hasVideoSurface} scroll=${stats.hasScrollableContent} " +
                 "renderView=${AdRules.hasAdRenderView(nodes)} " +
                 "texView=${AdRules.hasAdRenderSurface(nodes)} " +
                 "adItem=${AdRules.hasAdItemContainer(nodes)} " +
                 "sparse=${AdRules.looksLikeSparseAdItem(
-                    nodes, pageText, frameW, frameH,
-                    stats.visibleNodeCount, stats.hasVideoSurface,
+                    pageText, frameW, frameH,
+                    stats.hasVideoSurface, stats.hasScrollableContent,
                 )} " +
                 "countdown=$countdownFound streak=$adSwipeStreak",
         )
         var action = AdRules.match(
             nodes, pageText, frameW, frameH, fgPkg,
-            stats.visibleNodeCount, stats.hasVideoSurface,
+            stats.hasVideoSurface, stats.hasScrollableContent,
         )
         // **横屏策略（2026-10-31 修正）**：1.0.16 曾在这里无条件丢弃“渲染视图”判据，
         // 结果在小米平板 5 上翻车：实测那条直播样式的广告 `renderView=true adItem=true`，
@@ -610,8 +610,9 @@ class AdDetector(private val service: AccessibilityService) {
             if (held < AD_ITEM_CONFIRM_MS) {
                 Log.d(
                     TAG,
-                    "疑似广告(稀疏树 rawNodes=${stats.visibleNodeCount} textLen=${pageText.length} " +
-                        "surface=${stats.hasVideoSurface}) 已持续 ${held}ms，" +
+                    "疑似广告(稀疏树 rawNodes=${stats.visibleNodeCount} " +
+                        "textLen=${pageText.length} surface=${stats.hasVideoSurface} " +
+                        "scroll=${stats.hasScrollableContent}) 已持续 ${held}ms，" +
                         "${AD_ITEM_CONFIRM_MS - held}ms 后确认",
                 )
                 scheduleRetry((AD_ITEM_CONFIRM_MS - held).coerceAtLeast(50L), "稀疏树确认")
@@ -1604,13 +1605,15 @@ class AdDetector(private val service: AccessibilityService) {
 
     /**
      * 一次节点遍历的统计信息。
-     * - [visibleNodeCount]：**过滤前**的可见节点数（“稀疏树”判据必须用这个口径，见 AdRules）；
-     * - [hasVideoSurface]：页面是否挂了视频表面（SurfaceView/TextureView）。
+     * - [visibleNodeCount]：**过滤前**的可见节点数（排查用，也用于日志对比口径）；
+     * - [hasVideoSurface]：页面是否挂了视频表面（SurfaceView/TextureView）；
+     * - [hasScrollableContent]：页面是否有可滚动容器（列表 / 网格 / ViewPager）。
      *   它们通常没有 id/文字，会被 [collectNodes] 丢弃，所以只能在遍历时额外记录。
      */
     private class NodeStats {
         var visibleNodeCount = 0
         var hasVideoSurface = false
+        var hasScrollableContent = false
     }
 
     private fun collectNodes(
@@ -1629,6 +1632,9 @@ class AdDetector(private val service: AccessibilityService) {
             val cls = node.className?.toString().orEmpty()
             if (cls.contains("SurfaceView") || cls.contains("TextureView")) {
                 stats.hasVideoSurface = true
+            }
+            if (node.isScrollable) {
+                stats.hasScrollableContent = true
             }
             // 只保留“带文字/内容描述”或“带资源 id”的节点，可大幅减少节点数与主线程开销（拖动悬浮球更跟手）。
             // 必须额外保留带资源 id 的节点：直播样式广告的渲染视图（TextureView

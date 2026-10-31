@@ -133,8 +133,10 @@ object AdRules {
             nodes.any { it.viewIdResourceName?.endsWith("/$id") == true }
         }
 
-    /** “稀疏树广告”兜底判据的上限（实测：正剧 nodes 88~90 / textLen 108~124；广告 nodes 20~24 / textLen 0~15） */
-    private const val SPARSE_AD_MAX_NODES = 40
+    /**
+     * “稀疏树广告”兜底判据的文字上限（实测：正剧 textLen 96~133；广告 0~15；红果「新剧推荐」
+     * 列表页 0 —— 所以列表页不能靠文字区分，见 [looksLikeSparseAdItem] 的结构判据）。
+     */
     private const val SPARSE_AD_MAX_TEXT_LEN = 30
 
     /** “稀疏树广告”的判定原因 */
@@ -154,37 +156,38 @@ object AdRules {
      * **名称无关**的“广告 item”兜底判据（2026-10-23 用户提出：节点/id 数差异明显）。
      *
      * 条件（全部满足）：
-     * - **仅竖屏**：[screenW] < [screenH]。横屏正剧实测 `nodes=22 textLen=0`，与广告特征完全撞车；
-     * - **过滤前的可见节点数** ≤ [SPARSE_AD_MAX_NODES]（正剧 88~90；广告实测 20~24）；
-     * - 文字总量 ≤ [SPARSE_AD_MAX_TEXT_LEN] 字符（正剧 108~124；广告 0~15）；
+     * - **仅竖屏**：[screenW] < [screenH]。横屏正剧实测 `textLen=0`，与广告特征完全撞车；
+     * - 文字总量 ≤ [SPARSE_AD_MAX_TEXT_LEN] 字符（正剧 96~133；广告实测 0~15）；
      * - 页面存在**视频表面**（SurfaceView/TextureView）：广告创意画在视频层上；
+     * - 页面**没有可滚动容器**（列表 / 网格 / ViewPager）：全屏广告创意不会带滚动结构；
      * - 没有正剧播放控件（[hasPlaybackControls]）。
      *
-     * ⚠️ 节点数必须用**过滤前**的原始可见节点数：`AdDetector.collectNodes` 只保留带文字 /
-     * 内容描述 / 资源 id / TextureView 的节点，红果“新剧推荐”这类纯自绘列表页（98 个原始节点、
-     * 0 文字）会被压到 4~6 个节点，用过滤后的数量会把正常浏览页误判成广告（2026-10-31 实测）。
-     * 阈值 40 本身就是按原始节点数标定的，两者口径必须一致。
+     * ⚠️ 2026-10-31 修正——**弃用“节点数 ≤ 40”这条数字阈值**，改用上面的结构判据：
+     * - 旧阈值是用 **uiautomator 原始节点数**标定的（“正剧 84~92 / 广告 20~26”），可代码里比较的却是
+     *   `AdDetector.collectNodes` **过滤后**的节点数（只保留带文字/描述/资源 id/TextureView 的节点），
+     *   口径不一致。红果「新剧推荐」列表页（纯自绘海报，原始 84~98 节点、0 文字）
+     *   被压成 4~6 个节点 → 直接落进广告区间，**一开助手就把正常浏览页上滑**（实测复现）。
+     * - 而真实广告的原始节点数是 64~74（实测 2026-10-31 的红果广告），同样超过 40，
+     *   继续用数字阈值反而会**漏跳真广告**。结构判据（有视频层 + 无可滚动容器 + 读不到文字）
+     *   才能真正区分“全屏创意”与“内容列表页”。
      *
-     * ⚠️ 这是“缺失型”判据：**广告 → 正剧的过渡帧**（实测 `nodes=26~28 textLen=0`，持续约 400ms）
-     * 同样满足，所以调用方必须做**持久性确认**：AdDetector 里连续观测满
-     * `AD_ITEM_CONFIRM_MS`（800ms）才动手，且动作后清零重新确认。
+     * ⚠️ 这是“缺失型”判据：**广告 → 正剧的过渡帧**同样满足，所以调用方必须做**持久性确认**：
+     * AdDetector 里连续观测满 `AD_ITEM_CONFIRM_MS`（800ms）才动手，且动作后清零重新确认。
      *
-     * @param rawVisibleNodeCount 过滤前的可见节点数；传负数时退回 [nodes] 的数量（仅兼容旧调用）。
-     * @param hasVideoSurface 页面是否有 SurfaceView/TextureView；纯图片列表页没有视频表面，直接排除。
+     * @param hasVideoSurface 页面是否有 SurfaceView/TextureView；纯图片列表页没有视频表面。
+     * @param hasScrollableContent 页面是否有可滚动容器；内容列表页一定有，全屏广告创意没有。
      */
     fun looksLikeSparseAdItem(
-        nodes: List<AccessibilityNodeInfo>,
         pageText: String,
         screenW: Int,
         screenH: Int,
-        rawVisibleNodeCount: Int = -1,
         hasVideoSurface: Boolean = false,
+        hasScrollableContent: Boolean = false,
     ): Boolean {
         if (screenW <= 0 || screenH <= 0 || screenW >= screenH) return false
-        val nodeCount = if (rawVisibleNodeCount >= 0) rawVisibleNodeCount else nodes.size
-        if (nodeCount > SPARSE_AD_MAX_NODES) return false
         if (pageText.length > SPARSE_AD_MAX_TEXT_LEN) return false
         if (!hasVideoSurface) return false
+        if (hasScrollableContent) return false
         return !hasPlaybackControls(pageText)
     }
 
@@ -366,8 +369,9 @@ object AdRules {
      *        特征做位置过滤；为 0 时跳过位置过滤（向后兼容直接调用）。
      * @param pkg 当前前台包名。红果专属判据只对 [HONGUO_PACKAGE] 生效；
      *        传空（或不匹配）时这些判据全部跳过，只保留通用规则。
-     * @param rawVisibleNodeCount 过滤前的可见节点数（见 [looksLikeSparseAdItem]）。
      * @param hasVideoSurface 页面是否存在 SurfaceView/TextureView（见 [looksLikeSparseAdItem]）。
+     *        默认 false：不带该信息时按“没有视频层”处理，宁可漏跳也不误划（安全方向）。
+     * @param hasScrollableContent 页面是否有可滚动容器（见 [looksLikeSparseAdItem]）。
      */
     fun match(
         nodes: List<AccessibilityNodeInfo>,
@@ -375,8 +379,8 @@ object AdRules {
         screenW: Int = 0,
         screenH: Int = 0,
         pkg: String = "",
-        rawVisibleNodeCount: Int = -1,
         hasVideoSurface: Boolean = false,
+        hasScrollableContent: Boolean = false,
     ): AdAction? {
         // 去掉空白后做匹配，兼容“上滑 继续看短剧”这类带空格写法
         val compactText = pageText.replace(Regex("\\s+"), "")
@@ -451,7 +455,14 @@ object AdRules {
         //   ⚠️ 2026-10-27 修正——**仅限竖屏**：横屏全屏时正剧的视频层**有时就是 TextureView**
         //   （同一台设备先后采到 `surface=YES texture=no` 与 `surface=no texture=YES` 两种正剧状态），
         //   因此“出现 TextureView”在横屏不是广告特征；不过闸门会把正剧当广告连划。
-        if (isHonguo && isPortrait && hasAdRenderSurface(nodes)) {
+        //   ⚠️ 2026-10-31 修正——**要求页面几乎读不到文字**：广告创意画在视频层里，所以广告页
+        //   的文字总量是 0~15（实测样本）；而正常界面（播放页控件 / 列表页 / 过渡帧残留的旧窗口）
+        //   能读到 60~130 字。实测误判：从短剧播放页退出到「新剧推荐」时，
+        //   `collectFromAllWindows` 会把**同包名、非活动**的旧窗口节点一并收进来，
+        //   那些节点带着 `TextureView` + 61 字文本 → 被本分支当成广告，静置时莫名上滑两次。
+        if (isHonguo && isPortrait && pageText.length <= SPARSE_AD_MAX_TEXT_LEN &&
+            !hasScrollableContent && hasAdRenderSurface(nodes)
+        ) {
             val surface = nodes.firstOrNull {
                 it.className?.toString()?.contains(AD_RENDER_VIEW_CLASS) == true
             }
@@ -559,7 +570,7 @@ object AdRules {
         //     ⚠️ 仅对红果生效：这是缺失型判据，用在别的 App 上会把“Canvas/Surface 画正文”
         //     的页面（如读书软件）当成广告一直划（实测反馈）。
         if (isHonguo && looksLikeSparseAdItem(
-                nodes, pageText, screenW, screenH, rawVisibleNodeCount, hasVideoSurface,
+                pageText, screenW, screenH, hasVideoSurface, hasScrollableContent,
             )
         ) {
             return AdAction(

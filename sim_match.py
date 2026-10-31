@@ -11,7 +11,10 @@ on, AdAuto only acts inside the supported short-drama/video packages
 import re, os, sys
 import xml.etree.ElementTree as ET
 
-raw = open('ui_dump.xml', 'rb').read()
+# 可选参数：dump 文件路径（默认 ui_dump.xml）
+DUMP_PATH = sys.argv[1] if len(sys.argv) > 1 else 'ui_dump.xml'
+raw = open(DUMP_PATH, 'rb').read()
+print('dump file:', DUMP_PATH)
 try:
     xml = raw.decode('utf-8')
 except UnicodeDecodeError:
@@ -54,11 +57,12 @@ SCREEN_W, SCREEN_H = (int(_m.group(1)), int(_m.group(2))) if _m else (0, 0)
 IS_PORTRAIT = 0 < SCREEN_W < SCREEN_H
 
 class Node:
-    __slots__ = ('text', 'desc', 'cls', 'clickable', 'pkg', 'bounds', 'rid', 'children')
-    def __init__(self, text, desc, cls, clickable, pkg, bounds, rid, children):
+    __slots__ = ('text', 'desc', 'cls', 'clickable', 'pkg', 'bounds', 'rid', 'scrollable', 'children')
+    def __init__(self, text, desc, cls, clickable, pkg, bounds, rid, scrollable, children):
         self.text, self.desc, self.cls = text, desc, cls
         self.clickable, self.pkg, self.bounds = clickable, pkg, bounds
         self.rid = rid
+        self.scrollable = scrollable
         self.children = children
 
 def conv(el):
@@ -68,6 +72,7 @@ def conv(el):
         clickable=(el.get('clickable') == 'true'),
         pkg=el.get('package', '') or '', bounds=el.get('bounds', '') or '',
         rid=el.get('resource-id', '') or '',
+        scrollable=(el.get('scrollable') == 'true'),
         children=[conv(c) for c in el],
     )
 
@@ -84,6 +89,11 @@ def flatten(n):
             # 镜像 AccessibilityNodeInfo.isVisibleToUser：跳过零面积 / 上下颠倒的框
             # （红果广告里有一堆 [215,2038][276,1078] 这种帧，App 侧会被过滤掉）
             if x2 > x1 and y2 > y1:
+                stats['raw'] += 1
+                if 'SurfaceView' in n.cls or 'TextureView' in n.cls:
+                    stats['surface'] = True
+                if n.scrollable:
+                    stats['scroll'] = True
                 # 镜像 AdDetector.collectNodes：text / desc / resource-id / TextureView 四选一
                 if n.text.strip() or n.desc.strip() or n.rid.strip() or 'TextureView' in n.cls:
                     out.append(n)
@@ -91,8 +101,12 @@ def flatten(n):
         out.extend(flatten(c))
     return out
 
+# 镜像 AdDetector.NodeStats：过滤前的可见节点数 / 是否有视频表面 / 是否有可滚动容器
+stats = {'raw': 0, 'surface': False, 'scroll': False}
 nodes = flatten(root)
 print('collected nodes with text/desc:', len(nodes))
+print('rawVisibleNodeCount=%d surface=%s scrollable=%s'
+      % (stats['raw'], stats['surface'], stats['scroll']))
 
 # parent map for findClickable
 parents = {}
@@ -189,18 +203,20 @@ for k in PLAYBACK_CONTROL_KEYWORDS:
         print('   hit keyword:', k)
 
 # ---------- 2026-10-23 名称无关兜底：稀疏树（仅竖屏） ----------
-# 实测：正剧 nodes 88~90 / textLen 108~124；广告 nodes 20~24 / textLen 0~15。
-# 横屏正剧实测 nodes=22 textLen=0，与广告撞车 -> 仅竖屏生效。
-SPARSE_AD_MAX_NODES = 40
+# 2026-10-31 修正：弃用“节点数 ≤ 40”（该阈值按 uiautomator 原始节点数标定，代码里比的却是过滤后的
+# 节点数，红果「新剧推荐」列表页 84~98 原始节点/0 文字被压成 4~6 个 → 误判）。改成结构判据：
+# 有视频表面（创意画在视频层）+ 无可滚动容器（列表/网格才有）+ 读不到文字。
 SPARSE_AD_MAX_TEXT_LEN = 30
 looks_sparse = (
     SCREEN_W > 0 and SCREEN_H > 0 and SCREEN_W < SCREEN_H
-    and len(nodes) <= SPARSE_AD_MAX_NODES
     and len(pageText) <= SPARSE_AD_MAX_TEXT_LEN
+    and stats['surface']
+    and not stats['scroll']
     and not has_pc
 )
 print('looksLikeSparseAdItem =', looks_sparse,
-      '| screen=%dx%d nodes=%d textLen=%d' % (SCREEN_W, SCREEN_H, len(nodes), len(pageText)))
+      '| screen=%dx%d textLen=%d surface=%s scroll=%s'
+      % (SCREEN_W, SCREEN_H, len(pageText), stats['surface'], stats['scroll']))
 
 print()
 print('=== SWIPE_UP check ===')
