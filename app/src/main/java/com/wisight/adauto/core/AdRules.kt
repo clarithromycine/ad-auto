@@ -581,6 +581,22 @@ object AdRules {
     }
 
     /**
+     * 是否检测到“广告”角标。
+     * 供 `AdDetector` 的横屏策略判断“除了渲染视图之外还有没有独立正向证据”
+     * （2026-10-31：小米平板上的直播样式广告 renderView+adItem 同时为真，
+     * 若只凭渲染视图就丢动作会把真广告漏掉）。
+     */
+    fun hasAdBadge(
+        nodes: List<AccessibilityNodeInfo>,
+        screenW: Int,
+        screenH: Int,
+    ): Boolean = findAdBadgeNode(nodes, screenW, screenH) != null
+
+    /** 页面上是否有“上滑继续观看”类提示（独立于渲染视图的正向证据） */
+    fun hasSwipeHint(pageText: String): Boolean =
+        SWIPE_UP_KEYWORDS.any { pageText.contains(it) }
+
+    /**
      * 查找 Pangle 全屏广告的“广告”角标节点：文字或内容描述为“广告”，且位于屏幕**右上角**。
      * - Pangle 全屏广告的 disclosure 角标统一放在屏幕右上角，竖屏/横屏一致；
      * - 只按相对坐标判定（右上角区域），不依赖具体方向，横竖屏通用；

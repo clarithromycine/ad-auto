@@ -170,6 +170,15 @@ class AdDetector(private val service: AccessibilityService) {
         private const val LANDSCAPE_POLL_MS = 1_500L
         private const val LANDSCAPE_POLL_MAX = 40
         /**
+         * “安静期”探测间隔（毫秒）：一轮轮询预算用完后把频率降下来。
+         * 原因（2026-10-27）：`landscapePollLeft` 只约束“无事件时的自我轮询”，
+         * 而由无障碍事件驱动的那条路径（结果过期就再取一张）本来没有总上限 ——
+         * 横屏正剧一直在播（弹幕/画面持续产生 content change）时，截图会以约
+         * 1 张 / 2.5s 无限持续（实测 15s 内 5 张）。现在改为：预算用完后降频到
+         * 1 张 / 8s，既能显著省电，又不会在“停了很久之后又出广告”时完全漏掉。
+         */
+        private const val ORANGE_IDLE_PROBE_MS = 8_000L
+        /**
          * 低频看门狗：多久无条件重扫一次（毫秒）。
          * 上面那条轮询是在 `detectAndAct` **内部** 排的 —— 如果界面连一个无障碍事件都没有
          * （典型：横屏静止广告，视频画在 surface 上），`detectAndAct` 根本不会被调用，
@@ -178,6 +187,8 @@ class AdDetector(private val service: AccessibilityService) {
         private const val WATCHDOG_MS = 3_000L
         /** 距上次检测不足该时长时看门狗不重复扫（避免与事件路径重复工作） */
         private const val WATCHDOG_MIN_IDLE_MS = 2_500L
+        /** “闸门未通过”日志的节流间隔（内容变化事件每秒十几次，不能每条都打） */
+        private const val GATE_LOG_INTERVAL_MS = 3_000L
 
         /**
          * **横屏策略（2026-10-27 实验结论）**：横屏全屏、控件隐藏时，“有一个实心橙色按钮”
@@ -294,6 +305,9 @@ class AdDetector(private val service: AccessibilityService) {
     private var nextLandscapePollAt = 0L
     /** 上一次真正执行检测的时刻（看门狗据此避让事件路径） */
     private var lastDetectAt = 0L
+    /** 闸门日志节流：同一条消息 GATE_LOG_INTERVAL_MS 内只打一次 */
+    private var lastGateLogAt = 0L
+    private var lastGateMsg = ""
 
     /** 结束当前“广告上滑链”（窗口切换 / 锁期等待 / 换广告时调用） */
     private fun resetAdSwipeChain() {
@@ -394,6 +408,41 @@ class AdDetector(private val service: AccessibilityService) {
         }
     }
 
+    /**
+     * 闸门日志（带节流）。
+     * 背景（2026-10-31 小米平板 5 反馈“红果广告跳不过”）：这些前置闸门以前**只调 onResult**，
+     * 而事件路径/看门狗传的是空 lambda → 于是“跳不过，且 logcat 一片空白”，
+     * 完全看不出是哪一道门没通过。必须打出日志才能定位。
+     */
+    private fun logGate(msg: String) {
+        val now = SystemClock.uptimeMillis()
+        if (msg == lastGateMsg && now - lastGateLogAt < GATE_LOG_INTERVAL_MS) return
+        lastGateMsg = msg
+        lastGateLogAt = now
+        Log.d(TAG, "闸门未通过：$msg")
+    }
+
+    /** 当前所有无障碍窗口的简要结构（排查“前台包名为空”用） */
+    private fun windowSummary(): String {
+        return try {
+            val ws = service.windows
+            val sb = StringBuilder("windows=${ws.size}")
+            for (w in ws) {
+                val root = w.root
+                val pkg = root?.packageName?.toString().orEmpty()
+                val cls = root?.className?.toString()?.substringAfterLast('.') ?: "-"
+                sb.append(" {t=").append(w.type)
+                    .append(",a=").append(w.isActive)
+                    .append(",pkg=").append(if (pkg.isEmpty()) "-" else pkg)
+                    .append(",cls=").append(cls)
+                    .append("}")
+            }
+            sb.toString()
+        } catch (t: Throwable) {
+            "windows 读取失败: $t"
+        }
+    }
+
     private fun detectAndAct(onResult: (String) -> Unit = {}, isWindowStateChange: Boolean = false) {
         // 拖动悬浮球期间暂停检测，保证拖动流畅；结束后由悬浮球补扫一次
         if (isDragging) return
@@ -402,16 +451,19 @@ class AdDetector(private val service: AccessibilityService) {
         // 例如在设置页打开开关会触发界面变化事件，若不排除就会点到自己界面上的“跳过”/“关闭”。
         val fgPkg = foregroundPackage()
         if (fgPkg == null) {
+            logGate("前台包名为空（可能是锁屏/全屏视频/平板多窗口）→ ${windowSummary()}")
             onResult("无障碍服务尚未就绪")
             return
         }
         if (fgPkg in NON_AD_PACKAGES) {
+            logGate("前台是自身或系统界面：$fgPkg")
             onResult("当前界面是广告快跳自身或系统界面，无需检测")
             return
         }
         // 只在前台 App 属于“支持的包名”时才检测；通用模式下才对所有 App 检测（误触风险更高）。
         // 避免在普通 App（聊天/设置/桌面等）里把页面上的“广告/关闭/跳过”等字样误判成广告而自动点击。
         if (!SettingsManager.genericModeEnabled && fgPkg !in SettingsManager.supportedPackagesList()) {
+            logGate("前台 App 不在支持范围：$fgPkg（允许列表=${SettingsManager.supportedPackagesList()}）")
             onResult("当前 App（$fgPkg）不在自动跳过范围内")
             return
         }
@@ -435,6 +487,7 @@ class AdDetector(private val service: AccessibilityService) {
         Log.d(
             TAG,
             "scan: fg=$fgPkg nodes=${nodes.size} textLen=${pageText.length} " +
+                "frame=${frameW}x$frameH " +
                 "renderView=${AdRules.hasAdRenderView(nodes)} " +
                 "texView=${AdRules.hasAdRenderSurface(nodes)} " +
                 "adItem=${AdRules.hasAdItemContainer(nodes)} " +
@@ -442,14 +495,24 @@ class AdDetector(private val service: AccessibilityService) {
                 "countdown=$countdownFound streak=$adSwipeStreak",
         )
         var action = AdRules.match(nodes, pageText, frameW, frameH, fgPkg)
-        // **横屏策略**：禁用“渲染视图”类判据。广告 SDK 的渲染视图可能残留、与正剧共存，
-        // 而横屏全屏读不到任何文字 → `hasPlaybackControls` 保护失效 → 一旦残留就会误划正剧。
-        // 角标（`desc="广告"`）保留：那是 SDK 自画的广告标签，无猜测成分，且比截图快 2~3s。
+        // **横屏策略（2026-10-31 修正）**：1.0.16 曾在这里无条件丢弃“渲染视图”判据，
+        // 结果在小米平板 5 上翻车：实测那条直播样式的广告 `renderView=true adItem=true`，
+        // 而 `AdRules.match` 只返回**第一个**命中的分支（渲染视图），丢弃后不会继续去试
+        // “广告容器”，可这条广告橙色占比只有 0.11%（没有橙色 CTA）→ 三个信号全废 → 跳不过。
+        // 现在改成：只有当**没有别的独立正向证据**（广告容器/角标/上滑关键字）时才丢弃渲染视图，
+        // 保留“渲染视图残留、横屏误划正剧”的防护，同时不会把真广告漏掉。
         if (action != null && LANDSCAPE_IGNORE_RENDER_VIEW && frameW > frameH &&
             fgPkg == AdRules.HONGUO_PACKAGE && action.reason == AdRules.REASON_LIVE_AD
         ) {
-            Log.d(TAG, "横屏策略：忽略渲染视图判据 ${action.reason}，改由橙色按钮判定")
-            action = null
+            val hasOtherPositive = AdRules.hasAdItemContainer(nodes) ||
+                AdRules.hasAdBadge(nodes, frameW, frameH) ||
+                AdRules.hasSwipeHint(pageText)
+            if (hasOtherPositive) {
+                Log.d(TAG, "横屏策略：渲染视图另有独立证据，保留动作 ${action.reason}")
+            } else {
+                Log.d(TAG, "横屏策略：忽略渲染视图判据 ${action.reason}，改由橙色按钮判定")
+                action = null
+            }
         }
         // 用“画面里是否有一个实心橙色按钮”来区分广告/正剧（截图 + 颜色统计，无 OCR）。
         // 只在模糊态 & 非动作冷却期才截图；要求**两张不同截图**都命中才动手。
@@ -458,7 +521,9 @@ class AdDetector(private val service: AccessibilityService) {
         val landscapeAmbiguous = action == null &&
             isLandscapeAmbiguous(frameW, frameH, pageText, fgPkg)
         if (landscapeAmbiguous && nowOrange >= nextAllowedAt) {
-            val fresh = orangeAt != 0L && nowOrange - orangeAt <= ORANGE_RATIO_FRESH_MS
+            // 结果有效期：预算内用 2.5s（及时）；预算用完（说明看着正剧很久了）降频到 8s
+            val freshMs = if (landscapePollLeft > 0) ORANGE_RATIO_FRESH_MS else ORANGE_IDLE_PROBE_MS
+            val fresh = orangeAt != 0L && nowOrange - orangeAt <= freshMs
             if (!fresh) {
                 // 还没有可用截图：请求一次，并在结果回来后补扫一次
                 requestOrangeProbe()
@@ -506,18 +571,21 @@ class AdDetector(private val service: AccessibilityService) {
         // 无障碍**一个事件都没有**；一旦上滑补扫链结束，服务就彻底停摆
         // （实测现场 logcat 静默 10 分钟以上，广告一直挂着不划）。
         // 所以只要仍处于“分不出来”的模糊态且没有拿到动作，就自己定期再扫一次。
-        // 有次数上限：避免在横屏正剧上无限截图。
-        if (landscapeAmbiguous && action == null && landscapePollLeft > 0 &&
-            nowOrange >= nextLandscapePollAt
-        ) {
-            landscapePollLeft--
-            if (landscapePollLeft == 0) {
-                Log.d(TAG, "横屏主策略轮询 $LANDSCAPE_POLL_MAX 次用尽，停止轮询（等待新的无障碍事件）")
+        // 预算内 1.5s 一次；预算用完后降到 8s 一次（不完全停，保证“看了很久正剧之后
+        // 突然出广告”也能发现）。
+        if (landscapeAmbiguous && action == null && nowOrange >= nextLandscapePollAt) {
+            if (landscapePollLeft > 0) {
+                landscapePollLeft--
+                if (landscapePollLeft == 0) {
+                    Log.d(TAG, "横屏主策略轮询 $LANDSCAPE_POLL_MAX 次用尽，降频为 $ORANGE_IDLE_PROBE_MS ms/次")
+                }
             }
             val wait = if (nowOrange < nextAllowedAt) {
                 (nextAllowedAt - nowOrange).coerceAtLeast(200L)
-            } else {
+            } else if (landscapePollLeft > 0) {
                 LANDSCAPE_POLL_MS
+            } else {
+                ORANGE_IDLE_PROBE_MS
             }
             nextLandscapePollAt = nowOrange + wait
             requestOrangeProbe()
@@ -714,8 +782,14 @@ class AdDetector(private val service: AccessibilityService) {
     }
 
     /**
-     * 当前前台应用的包名：优先取活动窗口的根节点包名，失败时退回 rootInActiveWindow。
+     * 当前前台应用的包名：活动窗口 → 聚焦窗口 → rootInActiveWindow。
      * 用于把检测范围限定在前台应用，丢弃后台应用/系统设置窗口的残留文字。
+     *
+     * `isFocused` 这一级是 2026-10-31 加的回退：小米平板 5（MIUI Pad / Android 13）在
+     * 全屏广告这种状态下实测 `dumpsys window` 的 `mCurrentFocus=null`，很可能**没有任何
+     * 窗口被标成 active**；而原实现只认 `isActive`，于是直接返回 null → 第一道闸门静默
+     * 返回 → 规则与橙色探测全部不执行（表现为“广告跳不过、日志一片空白”）。
+     * 聚焦窗口（isFocused）与活动窗口语义等价，用它兜一层不会放宽安全边界。
      */
     private fun foregroundPackage(): String? {
         val windows = try {
@@ -725,7 +799,12 @@ class AdDetector(private val service: AccessibilityService) {
         }
         for (w in windows) {
             if (w.isActive) {
-                w.root?.packageName?.toString()?.let { return it }
+                w.root?.packageName?.toString()?.let { if (it.isNotEmpty()) return it }
+            }
+        }
+        for (w in windows) {
+            if (w.isFocused) {
+                w.root?.packageName?.toString()?.let { if (it.isNotEmpty()) return it }
             }
         }
         return try {
@@ -739,6 +818,16 @@ class AdDetector(private val service: AccessibilityService) {
      * 当前“屏幕范围”：活动应用窗口根节点的边界（与节点坐标同一坐标系）。
      * 用于给“广告角标”等位置敏感特征做过滤；横竖屏都正确。
      * 找不到活动应用窗口时退回 displayMetrics 的宽高。
+     */
+    /**
+     * 当前“屏幕范围”：活动应用窗口根节点的边界（与节点坐标同一坐标系），
+     * 用于给“广告角标”等位置敏感特征做过滤；横竖屏都正确。
+     * 找不到活动应用窗口时退回 displayMetrics 的宽高。
+     *
+     * 注（2026-10-31）：曾怀疑小米平板上“窗口方向 ≠ 显示器方向”，加过一层方向一致性校验，
+     * 但用户确认当时**确实竖屏测试过**（日志里的 `sparse=true` 是竖屏下的正常判定），
+     * 属于误判，已回退 —— 保持“窗口根节点边界优先”的原始行为，
+     * 只把 `frame=WxH` 打进 scan 日志，便于以后一眼看出当时是横屏还是竖屏。
      */
     private fun screenFrame(): Rect? {
         val windows = try {
@@ -1097,27 +1186,40 @@ class AdDetector(private val service: AccessibilityService) {
      * @return first = 是否判定为按钮，second = 排查用描述
      */
     private fun computeOrangeBar(src: Bitmap): Pair<Boolean, String> {
-        // **关键**：无障碍截图返回的是 Display P3（广色域）原始像素，而 adb screencap / 人眼看到的
-        // 是 sRGB。不转色域就直接比色，同一根橙色按钮会显得“颜色很散”（实测 ±12 纯度
-        // 0.68 vs screencap 0.998，均值 #FE8720 vs #EF8E3E）。所以先画到一张 sRGB 位图里。
-        val sw = try {
-            val out = Bitmap.createBitmap(
-                src.width,
-                src.height,
-                Bitmap.Config.ARGB_8888,
-                false,
-                ColorSpace.get(ColorSpace.Named.SRGB),
-            )
-            Canvas(out).drawBitmap(src, 0f, 0f, null)
-            out
+        // **关键**：无障碍截图可能带 Display P3（广色域）原始像素（手机实测），也可能是 sRGB
+        // （平板实测）。P3 不转色域就直接比色，同一根橙色按钮会显得“颜色很散”
+        // （±12 纯度 0.68 vs screencap 0.998）。所以统一转成 sRGB 再分析。
+        //
+        // ⚠️ 顺序很重要：必须**先 copy 成软件位图**，再画到 sRGB 画布。
+        // 软件 Canvas 不能直接画 HARDWARE 位图 —— 小米平板 5 / Android 13 实测抛
+        // `IllegalArgumentException: Software rendering doesn't support hardware bitmaps`，
+        // 而之前的实现正是先 Canvas 后 copy，导致平板上一路退回原图（色域没统一）。
+        val srgb = ColorSpace.get(ColorSpace.Named.SRGB)
+        val soft = try {
+            src.copy(Bitmap.Config.ARGB_8888, false)
         } catch (t: Throwable) {
-            Log.w(TAG, "转 sRGB 失败，退回原图：$t")
-            try {
-                src.copy(Bitmap.Config.ARGB_8888, false)
-            } catch (t2: Throwable) {
-                null
-            }
+            Log.w(TAG, "copy bitmap 失败：$t")
+            null
         } ?: return false to "copy bitmap 失败"
+        val sw = if (soft.colorSpace == srgb) {
+            soft
+        } else {
+            try {
+                val out = Bitmap.createBitmap(
+                    soft.width,
+                    soft.height,
+                    Bitmap.Config.ARGB_8888,
+                    false,
+                    srgb,
+                )
+                Canvas(out).drawBitmap(soft, 0f, 0f, null)
+                soft.recycle()
+                out
+            } catch (t: Throwable) {
+                Log.w(TAG, "转 sRGB 失败，退回原图（${soft.colorSpace}）：$t")
+                soft
+            }
+        }
         try {
             val w = sw.width
             val h = sw.height
