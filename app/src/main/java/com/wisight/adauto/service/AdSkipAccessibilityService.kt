@@ -28,7 +28,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         detector?.startWatchdog()
         // 拉起悬浮球服务（悬浮球关闭时球体是透明的，但服务仍然要跑）：
         // 没有前台服务时 App 在后台会被 MIUI/HyperOS 挂起 → 收不到无障碍事件 → 不跳广告。
-        if (SettingsManager.ballEnabled || SettingsManager.adSkipEnabled) {
+        // 调试浮层也挂在它上面，所以开着调试时同样要拉起。
+        if (SettingsManager.ballEnabled || SettingsManager.adSkipEnabled ||
+            SettingsManager.debugOverlayEnabled
+        ) {
             try {
                 FloatingBallService.start(this)
             } catch (_: Throwable) {

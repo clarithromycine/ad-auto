@@ -5,14 +5,20 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
+import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -21,12 +27,15 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.wisight.adauto.MainActivity
 import com.wisight.adauto.R
 import com.wisight.adauto.core.AdDetector
+import com.wisight.adauto.core.DebugTrace
 import com.wisight.adauto.core.SettingsManager
 import kotlin.math.abs
 
@@ -41,6 +50,8 @@ class FloatingBallService : Service() {
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "floating_ball"
         private const val TAG = "AdAutoBall"
+        /** 调试浮层刷新间隔（毫秒）：只是读一个字符串，成本极低 */
+        private const val DEBUG_TICK_MS = 500L
 
         @Volatile
         var instance: FloatingBallService? = null
@@ -59,6 +70,18 @@ class FloatingBallService : Service() {
     private lateinit var windowManager: WindowManager
     private var ballView: View? = null
     private var layoutParams: WindowManager.LayoutParams? = null
+
+    /** 调试浮层（设置页开关控制）。不参与任何判定，详见 showDebugOverlay 的注释 */
+    private var debugRoot: View? = null
+    private var debugText: TextView? = null
+    private var debugHeader: TextView? = null
+    private val debugHandler = Handler(Looper.getMainLooper())
+    private val debugTick = object : Runnable {
+        override fun run() {
+            updateDebugText()
+            debugHandler.postDelayed(this, DEBUG_TICK_MS)
+        }
+    }
 
     private var initialX = 0
     private var initialY = 0
@@ -91,10 +114,13 @@ class FloatingBallService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // 设置页改了“显示悬浮球/自动跳过”后再次进来：刷新球体外观（可见 / 透明）
         updateBallStyle()
+        // 调试浮层跟随设置状态（开关即时生效）
+        refreshDebugOverlay()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        hideDebugOverlay()
         removeBall()
         instance = null
         super.onDestroy()
@@ -241,6 +267,170 @@ class FloatingBallService : Service() {
         val intent = Intent(this, MainActivity::class.java)
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         startActivity(intent)
+    }
+
+    // ==================== 调试浮层 ====================
+
+    /**
+     * 设置页切换“调试详情浮层”后调用（也可由 [onStartCommand] 触发）。
+     */
+    fun refreshDebugOverlay() {
+        if (SettingsManager.debugOverlayEnabled) showDebugOverlay() else hideDebugOverlay()
+    }
+
+    /**
+     * 显示调试浮层：实时打印“当前界面是怎么判定的”，并带一个「复制」按钮。
+     *
+     * **为什么它不会影响判定**（这是本功能最关键的设计点）：
+     * 1. `importantForAccessibility = NO_HIDE_DESCENDANTS` —— 整个窗口（包括复制按钮）
+     *    **完全不进入无障碍树**，任何 `AccessibilityService`（包括我们自己）都读不到它的文字/节点；
+     * 2. 仍是 `FLAG_NOT_FOCUSABLE` —— 不抢焦点，不会成为 `mCurrentFocus`/活动窗口，
+     *    因此完全不影响 `foregroundPackage()` 的包名判断；
+     * 3. 即便前两条都失效，检测侧仍会把 `com.wisight.adauto` 的窗口从节点采集里剔除
+     *    （`NON_AD_PACKAGES`），并且它的文字里也不含“跳过/广告”这类会被点击规则命中的词。
+     *
+     * ⚠️ 为了能点「复制」，窗口**不再是 `FLAG_NOT_TOUCHABLE`**（否则按不到按钮）。
+     * 代价是浮层所占的那一小块区域（右上角 260dp 宽）不会再把手势传给下面的 App。
+     * 这是"可交互"与"零触摸干扰"之间必须做的取舍：只用调试时才会出现，且不抢焦点、
+     * 不影响任何判定逻辑。
+     */
+    private fun showDebugOverlay() {
+        if (debugRoot != null) return
+        if (!Settings.canDrawOverlays(this)) return
+
+        val chipBg = GradientDrawable().apply {
+            cornerRadius = dp(6).toFloat()
+            setColor(0x33FFFFFF)
+            setStroke(dp(1), 0x66FFFFFF)
+        }
+        val copyBtn = TextView(this).apply {
+            text = "复制"
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 11f
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = chipBg
+            isClickable = true
+            setOnClickListener { copyDebugText() }
+        }
+        val header = TextView(this).apply {
+            setTextColor(0xAAFFFFFF.toInt())
+            textSize = 10f
+            setPadding(dp(6), 0, 0, 0)
+            text = "调试浮层"
+            typeface = Typeface.MONOSPACE
+        }
+        val detail = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 10f
+            setPadding(0, dp(4), 0, 0)
+            typeface = Typeface.MONOSPACE
+            maxLines = 14
+            ellipsize = TextUtils.TruncateAt.END
+            text = "等待检测…"
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(0xCC000000.toInt())
+                setStroke(dp(1), 0x66FFFFFF)
+            }
+            addView(
+                LinearLayout(this@FloatingBallService).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(copyBtn)
+                    addView(header)
+                },
+            )
+            addView(detail)
+            // 整个浮层都可点：点任意位置即复制（按钮太小容易点不准，且调试时不想擕）
+            isClickable = true
+            setOnClickListener { copyDebugText() }
+            // 隔离①：整个浮层（含按钮）对无障碍完全隐身
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        }
+        val params = WindowManager.LayoutParams(
+            dp(260),
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_PHONE
+            },
+            // 隔离②：不抢焦点（可触摸是为了点「复制」）
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            x = dp(12)
+            y = dp(90)
+            title = "AdAutoDebugOverlay"
+        }
+        try {
+            windowManager.addView(root, params)
+            debugRoot = root
+            debugText = detail
+            debugHeader = header
+            debugHandler.removeCallbacks(debugTick)
+            debugHandler.post(debugTick)
+            Log.i(TAG, "debug overlay shown")
+        } catch (t: Throwable) {
+            Log.w(TAG, "debug overlay addView failed: $t")
+            debugRoot = null
+            debugText = null
+            debugHeader = null
+        }
+    }
+
+    private fun hideDebugOverlay() {
+        debugHandler.removeCallbacks(debugTick)
+        val v = debugRoot ?: return
+        try {
+            windowManager.removeView(v)
+        } catch (_: Throwable) {
+        }
+        debugRoot = null
+        debugText = null
+        debugHeader = null
+        DebugTrace.clear()
+        Log.i(TAG, "debug overlay hidden")
+    }
+
+    /** 把完整判定详情复制到剪贴板（复制的是完整文本，不是屏幕上被截断的那份） */
+    private fun copyDebugText() {
+        val detail = DebugTrace.detail
+        if (detail.isEmpty()) {
+            Toast.makeText(this, "暂无调试信息", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val text = "#${DebugTrace.seq}\n$detail"
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("ad-auto debug", text))
+            Toast.makeText(this, "调试信息已复制", Toast.LENGTH_SHORT).show()
+            Log.i(TAG, "debug detail copied, ${text.length} chars")
+        } catch (t: Throwable) {
+            Log.w(TAG, "copy failed: $t")
+            Toast.makeText(this, "复制失败", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun updateDebugText() {
+        val tv = debugText ?: return
+        val detail = DebugTrace.detail
+        val autoSkip = if (SettingsManager.adSkipEnabled) "开" else "关"
+        if (detail.isEmpty()) {
+            tv.text = "等待检测…（自动跳过=$autoSkip）"
+            debugHeader?.text = "调试浮层"
+            return
+        }
+        val age = if (DebugTrace.updatedAt == 0L) -1L else SystemClock.uptimeMillis() - DebugTrace.updatedAt
+        tv.text = detail
+        debugHeader?.text = "调试浮层  #${DebugTrace.seq} ${age}ms前"
     }
 
     private fun removeBall() {

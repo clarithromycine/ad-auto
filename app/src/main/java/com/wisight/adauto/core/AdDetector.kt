@@ -246,7 +246,7 @@ class AdDetector(private val service: AccessibilityService) {
     /** 延迟重扫任务：到点后重新检测一次（广告文案晚渲染 / 倒计时结束时的兜底） */
     private val retryRunnable = Runnable {
         retryPending = false
-        if (SettingsManager.adSkipEnabled) {
+        if (detectionEnabled()) {
             detectAndAct(isWindowStateChange = false)
         }
     }
@@ -308,6 +308,26 @@ class AdDetector(private val service: AccessibilityService) {
     /** 闸门日志节流：同一条消息 GATE_LOG_INTERVAL_MS 内只打一次 */
     private var lastGateLogAt = 0L
     private var lastGateMsg = ""
+    /** 本次检测的“特征快照”文本（仅调试浮层开启时拼装，否则为空串 → 零开销） */
+    private var traceBase = ""
+
+    /**
+     * 是否需要检测。
+     *
+     * - **调试浮层开启时：始终检测**（与“自动跳过”/悬浮球状态无关）—— 排查“为什么跳不过”时
+     *   必须在关闭自动跳过的状态下也能看到判定过程；
+     * - 否则：仅在“自动跳过”开启时检测（关闭时不做任何检测）。
+     *
+     * 注意：检测 ≠ 执行，执行由 [actionAllowed] 单独控制。
+     */
+    private fun detectionEnabled(): Boolean =
+        SettingsManager.adSkipEnabled || SettingsManager.debugOverlayEnabled
+
+    /**
+     * 是否允许真正执行动作（滑走/点击）。
+     * 调试观察模式下（自动跳过关闭、只开着调试浮层）**只看不动**，避免排查时把内容划走。
+     */
+    private fun actionAllowed(): Boolean = SettingsManager.adSkipEnabled
 
     /** 结束当前“广告上滑链”（窗口切换 / 锁期等待 / 换广告时调用） */
     private fun resetAdSwipeChain() {
@@ -316,9 +336,9 @@ class AdDetector(private val service: AccessibilityService) {
     }
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {
-        if (!SettingsManager.adSkipEnabled) {
+        if (!detectionEnabled()) {
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                Log.d(TAG, "自动跳过已关闭，界面变化不检测")
+                Log.d(TAG, "自动跳过已关闭且未开调试浮层，界面变化不检测")
             }
             return
         }
@@ -394,7 +414,7 @@ class AdDetector(private val service: AccessibilityService) {
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             try {
-                if (SettingsManager.adSkipEnabled && !isDragging) {
+                if (detectionEnabled() && !isDragging) {
                     val now = SystemClock.uptimeMillis()
                     if (now - lastDetectAt >= WATCHDOG_MIN_IDLE_MS) {
                         detectAndAct(isWindowStateChange = false)
@@ -420,6 +440,13 @@ class AdDetector(private val service: AccessibilityService) {
         lastGateMsg = msg
         lastGateLogAt = now
         Log.d(TAG, "闸门未通过：$msg")
+        if (SettingsManager.debugOverlayEnabled) DebugTrace.update("闸门未通过：$msg")
+    }
+
+    /** 调试浮层：在“特征快照”后面追加本次的判定结论 */
+    private fun traceOutcome(outcome: String) {
+        if (!SettingsManager.debugOverlayEnabled) return
+        DebugTrace.update(if (traceBase.isEmpty()) outcome else "$traceBase\n$outcome")
     }
 
     /** 当前所有无障碍窗口的简要结构（排查“前台包名为空”用） */
@@ -485,20 +512,34 @@ class AdDetector(private val service: AccessibilityService) {
         val frameW = frame?.width() ?: 0
         val frameH = frame?.height() ?: 0
         // 排查用：本次到底看到了什么（节点数 / 文字长度 / 各渲染视图 / 是否像“稀疏树广告”）
+        val hasRenderView = AdRules.hasAdRenderView(nodes)
+        val hasTexView = AdRules.hasAdRenderSurface(nodes)
+        val hasAdItem = AdRules.hasAdItemContainer(nodes)
+        val looksSparse = AdRules.looksLikeSparseAdItem(
+            pageText, frameW, frameH,
+            stats.hasVideoSurface, stats.hasScrollableContent,
+        )
         Log.d(
             TAG,
             "scan: fg=$fgPkg nodes=${nodes.size} rawNodes=${stats.visibleNodeCount} " +
                 "textLen=${pageText.length} frame=${frameW}x$frameH " +
                 "surface=${stats.hasVideoSurface} scroll=${stats.hasScrollableContent} " +
-                "renderView=${AdRules.hasAdRenderView(nodes)} " +
-                "texView=${AdRules.hasAdRenderSurface(nodes)} " +
-                "adItem=${AdRules.hasAdItemContainer(nodes)} " +
-                "sparse=${AdRules.looksLikeSparseAdItem(
-                    pageText, frameW, frameH,
-                    stats.hasVideoSurface, stats.hasScrollableContent,
-                )} " +
-                "countdown=$countdownFound streak=$adSwipeStreak",
+                "renderView=$hasRenderView texView=$hasTexView adItem=$hasAdItem " +
+                "sparse=$looksSparse countdown=$countdownFound streak=$adSwipeStreak",
         )
+        // 调试浮层（设置页开关）：记录本次“看到了什么”。关闭时 traceBase 为空串，零开销。
+        traceBase = if (SettingsManager.debugOverlayEnabled) {
+            // 顶部标注当前模式：自动跳过关闭时是“仅调试·不执行”（只看不动）
+            val mode = if (SettingsManager.adSkipEnabled) "" else "【仅调试·不执行】\n"
+            mode +
+                "fg=$fgPkg  ${frameW}x$frameH\n" +
+                "nodes=${nodes.size}/${stats.visibleNodeCount} textLen=${pageText.length}\n" +
+                "rv=$hasRenderView tex=$hasTexView adItem=$hasAdItem\n" +
+                "sparse=$looksSparse cd=$countdownFound\n" +
+                "surface=${stats.hasVideoSurface} scroll=${stats.hasScrollableContent}"
+        } else {
+            ""
+        }
         var action = AdRules.match(
             nodes, pageText, frameW, frameH, fgPkg,
             stats.hasVideoSurface, stats.hasScrollableContent,
@@ -554,6 +595,7 @@ class AdDetector(private val service: AccessibilityService) {
             if (orangeSeq != lastLoggedOrangeSeq) {
                 lastLoggedOrangeSeq = orangeSeq
                 Log.d(TAG, "横屏主策略：$orangeInfo 命中 $orangeHitCount/$ORANGE_HITS_REQUIRED")
+                traceOutcome("橙: $orangeInfo\n命中 $orangeHitCount/$ORANGE_HITS_REQUIRED")
             }
             if (orangeHitCount >= ORANGE_HITS_REQUIRED) {
                 orangeHitCount = 0
@@ -621,6 +663,15 @@ class AdDetector(private val service: AccessibilityService) {
             }
         }
         if (action != null) {
+            // **调试观察模式**：自动跳过关闭、只开着调试浮层 → 只显示判定结果，绝不执行动作。
+            // 这样排查时可以放心盯着调试浮层看，不会把正在看的内容划走。
+            // （检测本身仍持续进行，见 detectionEnabled()）
+            if (!actionAllowed()) {
+                Log.i(TAG, "仅调试：命中 ${action.type} (${action.reason})，未执行（自动跳过已关闭）")
+                traceOutcome("→ ${action.type}（${action.reason}）\n【仅调试·不执行】")
+                recycleAll(nodes)
+                return
+            }
             // 直播样式广告（渲染视图判定）：页面无任何文字，既读不到倒计时、也没有可用的
             // 播放按钮，而点屏幕正中有“误入直播间”的风险 —— 清掉倒计时/暂停状态，直接划走。
             if (action.immediate) {
@@ -734,6 +785,7 @@ class AdDetector(private val service: AccessibilityService) {
             // 动作后清零：避免紧接着的“广告→正剧”过渡帧（仍满足稀疏条件）被立即再次划走
             if (action.reason == AdRules.REASON_SPARSE_AD) sparseAdSinceAt = 0L
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
+            traceOutcome("→ ${action.type}（${action.reason}）${if (ok) "已执行" else "执行失败"}")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
             if (isAdSwipe) {
                 // 上滑类广告（直播渲染视图 / 穿山甲角标 / 立即领取 / “上滑继续观看”）：
@@ -786,6 +838,7 @@ class AdDetector(private val service: AccessibilityService) {
                 }
             }
             onResult("当前界面未检测到广告")
+            traceOutcome("→ 未命中任何广告规则")
             maybeScheduleRetry(fgPkg, isWindowStateChange, pageText)
         }
         recycleAll(nodes)

@@ -18,7 +18,6 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.wisight.adauto.core.SettingsManager
 import com.wisight.adauto.databinding.ActivityMainBinding
-import com.wisight.adauto.service.AdSkipAccessibilityService
 import com.wisight.adauto.service.FloatingBallService
 
 class MainActivity : AppCompatActivity() {
@@ -85,7 +84,10 @@ class MainActivity : AppCompatActivity() {
             SettingsManager.adSkipEnabled = checked
             binding.switchSkip.isChecked = checked
             // 两个开关都关闭时才真正停掉服务（悬浮球“隐藏”时服务要继续留着，见下）
-            if (!checked && !SettingsManager.ballEnabled) FloatingBallService.stop(this)
+            // 但开着调试浮层时服务不能停（浮层挂在它上面）
+            if (!checked && !SettingsManager.ballEnabled && !SettingsManager.debugOverlayEnabled) {
+                FloatingBallService.stop(this)
+            }
         }
         binding.switchBall.setOnCheckedChangeListener { _, checked ->
             SettingsManager.ballEnabled = checked
@@ -95,6 +97,18 @@ class MainActivity : AppCompatActivity() {
         }
         // “自动跳过范围”开关只改 UI 状态提示，真正写入要等点“保存规则”（与包名输入框同组）
         binding.switchGenericMode.setOnCheckedChangeListener { _, _ -> updateScopeStatus() }
+        // 调试浮层：即时生效（不归“保存规则”管）
+        binding.switchDebugOverlay.setOnCheckedChangeListener { _, checked ->
+            SettingsManager.debugOverlayEnabled = checked
+            // 服务没跑的话先拉起来（浮层挂在悬浮球服务上）
+            if (checked) FloatingBallService.start(this)
+            FloatingBallService.instance?.refreshDebugOverlay()
+            Toast.makeText(
+                this,
+                if (checked) R.string.toast_debug_overlay_on else R.string.toast_debug_overlay_off,
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
         binding.btnSaveRules.setOnClickListener {
             SettingsManager.customKeywords = binding.etCustomKeywords.text?.toString()?.trim().orEmpty()
             SettingsManager.supportedPackages = binding.etSupportedPackages.text?.toString()?.trim().orEmpty()
@@ -102,26 +116,6 @@ class MainActivity : AppCompatActivity() {
             SettingsManager.genericModeEnabled = !binding.switchGenericMode.isChecked
             updateScopeStatus()
             Toast.makeText(this, R.string.toast_rule_saved, Toast.LENGTH_SHORT).show()
-        }
-        binding.btnScanNow.setOnClickListener {
-            scanNow()
-        }
-    }
-
-    private fun scanNow() {
-        if (!isAccessibilityEnabled()) {
-            Toast.makeText(this, R.string.toast_accessibility_required, Toast.LENGTH_SHORT).show()
-            return
-        }
-        val svc = AdSkipAccessibilityService.instance
-        if (svc == null) {
-            Toast.makeText(this, R.string.toast_accessibility_required, Toast.LENGTH_SHORT).show()
-            return
-        }
-        svc.scanOnce { msg ->
-            runOnUiThread {
-                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-            }
         }
     }
 
@@ -155,6 +149,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.switchSkip.isChecked = SettingsManager.adSkipEnabled
         binding.switchBall.isChecked = SettingsManager.ballEnabled
+        binding.switchDebugOverlay.isChecked = SettingsManager.debugOverlayEnabled
 
         binding.tvOverallStatus.setText(
             if (a11y && overlay) R.string.status_enabled else R.string.status_disabled

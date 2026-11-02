@@ -14,6 +14,7 @@ object SettingsManager {
     private const val KEY_CUSTOM_KEYWORDS = "custom_keywords"
     private const val KEY_SUPPORTED_PACKAGES = "supported_packages"
     private const val KEY_GENERIC_MODE = "generic_mode"
+    private const val KEY_DEBUG_OVERLAY = "debug_overlay"
 
     private lateinit var prefs: SharedPreferences
 
@@ -69,5 +70,19 @@ object SettingsManager {
         get() = prefs.getBoolean(KEY_GENERIC_MODE, false)
         set(value) {
             prefs.edit().putBoolean(KEY_GENERIC_MODE, value).apply()
+        }
+
+    /**
+     * 调试浮层：在屏幕上实时显示“当前界面是怎么判定的”（命中了哪条规则 / 各特征值 /
+     * 闸门拦截原因 / 动作结果），供排查“跳不过”类问题用。
+     *
+     * 默认关闭。开启后浮层不参与检测（详见 [DebugTrace] 与 FloatingBallService 的窗口参数）：
+     * 不可聚焦、不可触摸、且对无障碍**完全隐藏**（IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS），
+     * 因此不会影响任何判定。
+     */
+    var debugOverlayEnabled: Boolean
+        get() = prefs.getBoolean(KEY_DEBUG_OVERLAY, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_DEBUG_OVERLAY, value).apply()
         }
 }

@@ -41,8 +41,7 @@
     <string name="btn_save">保存规则</string>
 
     <string name="toast_rule_saved">规则已保存</string>
-    <string name="toast_accessibility_required">请先开启无障碍服务</string>
-    <string name="toast_overlay_required">请先授予悬浮窗权限</string>
+    <string name="toast_accessibility_required">请先开启无障碍服务</string>    <string name="toast_overlay_required">请先授予悬浮窗权限</string>
     <string name="toast_ball_started">悬浮球已启动</string>
     <string name="toast_ball_stopped">悬浮球已停止</string>
     <string name="toast_skip_on">自动跳过广告已开启</string>
@@ -53,7 +52,12 @@
     <string name="notif_ball_title">广告快跳运行中</string>
     <string name="notif_ball_text">悬浮球已就位，正在自动工作</string>
 
-    <string name="btn_scan_now">立即检测当前界面</string>
-    <string name="toast_no_ad">当前界面未检测到广告</string>
     <string name="toast_ad_skipped">检测到广告，已自动跳过</string>
+
+    <!-- 调试 -->
+    <string name="section_debug">调试</string>
+    <string name="debug_overlay_title">显示判定详情浮层</string>
+    <string name="debug_overlay_desc">在屏幕上实时显示“当前界面是怎么判定的”：命中的规则、各特征值、闸门拦截原因。仅供排查问题使用 —— 浮层对无障碍完全隐藏、不可触摸、不抢焦点，不会影响判定。</string>
+    <string name="toast_debug_overlay_on">调试浮层已开启（右上角）</string>
+    <string name="toast_debug_overlay_off">调试浮层已关闭</string>
 </resources>
