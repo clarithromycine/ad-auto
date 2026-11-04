@@ -184,6 +184,12 @@ time=2026-11-04 11:19:47
 > ⚠️ `keystore/adauto.keystore` 与 `keystore.properties` **不在仓库里**，请离线备份。
 > 丢了就无法给老用户无缝升级，只能卸载重装（旧设置全部丢失）。
 
+### 界面诊断脚本
+
+`tools/ui-diagnose/` 下有一组排查「为什么这条广告没跳过」的脚本
+（抓界面、按规则判定、复刻匹配逻辑、对比广告页与正剧页等），
+只做取证与分析，不操作手机。用法见 [tools/ui-diagnose/README.md](tools/ui-diagnose/README.md)。
+
 ---
 
 ## 七、版本

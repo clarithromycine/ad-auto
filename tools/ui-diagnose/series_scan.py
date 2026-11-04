@@ -4,7 +4,7 @@
 用于找出「广告界面」与「正剧播放界面」在无障碍树里的区别特征。
 
 用法： python series_scan.py [样本数] [间隔秒]
-输出： cap/series/sNN.png + cap/series/sNN.xml，以及每帧指纹摘要。
+输出： ./cap/series/sNN.png + ./cap/series/sNN.xml（相对本脚本目录）
 """
 import os
 import re
@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 20
 INTERVAL = float(sys.argv[2]) if len(sys.argv) > 2 else 3.5
 
-OUT = os.path.join('cap', 'series')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cap', 'series')
 os.makedirs(OUT, exist_ok=True)
 
 

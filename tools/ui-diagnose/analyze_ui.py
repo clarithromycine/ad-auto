@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-分析一份 uiautomator dump（默认 ui_dump.xml，可传路径参数），
+分析一份 uiautomator dump（默认 sample/ui_dump.xml，可传路径参数），
 输出界面上所有文字/描述节点 + 按 AdRules 的关键字判定结果，
 用于排查“广告没能被跳过”的原因（纯分析，不执行动作）。
 
 用法： python analyze_ui.py [ui_now.xml]
 """
+import os
 import re
 import sys
 
-path = sys.argv[1] if len(sys.argv) > 1 else 'ui_dump.xml'
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_HERE, 'sample', 'ui_dump.xml')
 raw = open(path, 'rb').read()
 try:
     t = raw.decode('utf-8')

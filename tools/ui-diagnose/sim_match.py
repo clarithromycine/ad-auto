@@ -11,8 +11,10 @@ on, AdAuto only acts inside the supported short-drama/video packages
 import re, os, sys
 import xml.etree.ElementTree as ET
 
-# 可选参数：dump 文件路径（默认 ui_dump.xml）
-DUMP_PATH = sys.argv[1] if len(sys.argv) > 1 else 'ui_dump.xml'
+# 可选参数：dump 文件路径（默认本目录 sample/ui_dump.xml）
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DUMP_PATH = (sys.argv[1] if len(sys.argv) > 1
+             else os.path.join(_HERE, 'sample', 'ui_dump.xml'))
 raw = open(DUMP_PATH, 'rb').read()
 print('dump file:', DUMP_PATH)
 try:

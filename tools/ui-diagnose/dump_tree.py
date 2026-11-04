@@ -6,11 +6,14 @@ clickable / scrollable / text / desc，用于分析“结构特征”（无障�
 
 用法： python dump_tree.py [ui_now.xml]
 """
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
 
-path = sys.argv[1] if len(sys.argv) > 1 else 'ui_dump.xml'
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_HERE, 'sample', 'ui_dump.xml')
 raw = open(path, 'rb').read()
 try:
     t = raw.decode('utf-8')

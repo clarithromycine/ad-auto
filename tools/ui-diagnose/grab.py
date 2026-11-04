@@ -8,7 +8,7 @@ uiautomator 常报 "could not get idle state"），并打印关键结构指纹�
 - 中央 539x140 胶囊（“点击进入直播间”提示条）及其子节点
 
 用法： python grab.py 标签 [重试次数]
-输出： cap/grab_<标签>.png / .xml
+输出： ./cap/grab_<标签>.png / .xml（相对本脚本目录）
 """
 import os
 import re
@@ -20,8 +20,10 @@ import xml.etree.ElementTree as ET
 tag = sys.argv[1] if len(sys.argv) > 1 else 'x'
 retries = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 
-png = os.path.join('cap', 'grab_%s.png' % tag)
-xml = os.path.join('cap', 'grab_%s.xml' % tag)
+CAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cap')
+os.makedirs(CAP, exist_ok=True)
+png = os.path.join(CAP, 'grab_%s.png' % tag)
+xml = os.path.join(CAP, 'grab_%s.xml' % tag)
 
 
 def adb(*args):
