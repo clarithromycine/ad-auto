@@ -10,6 +10,15 @@
     <!-- Android 13+ 通知 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      包可见性（Android 11+）：只声明「红果免费短剧」这一个包，用于在用户点「复制」
+      时一并带上目标 App 的版本号。不声明 QUERY_ALL_PACKAGES，因此本应用看不到其它
+      已安装应用，也无法枚举应用列表。
+    -->
+    <queries>
+        <package android:name="com.phoenix.read" />
+    </queries>
+
     <application
         android:name=".App"
         android:allowBackup="true"

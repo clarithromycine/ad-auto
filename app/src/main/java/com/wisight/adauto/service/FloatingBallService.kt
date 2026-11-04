@@ -19,6 +19,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -37,6 +38,9 @@ import com.wisight.adauto.R
 import com.wisight.adauto.core.AdDetector
 import com.wisight.adauto.core.DebugTrace
 import com.wisight.adauto.core.SettingsManager
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.abs
 
 /**
@@ -52,6 +56,9 @@ class FloatingBallService : Service() {
         private const val TAG = "AdAutoBall"
         /** 调试浮层刷新间隔（毫秒）：只是读一个字符串，成本极低 */
         private const val DEBUG_TICK_MS = 500L
+
+        /** 从判定快照里取目标 App 包名（`AdDetector` 写的 `fg=...` 那一行） */
+        private val TARGET_PKG_REGEX = Regex("""fg=([A-Za-z0-9_.]+)""")
 
         @Volatile
         var instance: FloatingBallService? = null
@@ -400,14 +407,20 @@ class FloatingBallService : Service() {
         Log.i(TAG, "debug overlay hidden")
     }
 
-    /** 把完整判定详情复制到剪贴板（复制的是完整文本，不是屏幕上被截断的那份） */
+    /**
+     * 把完整判定详情复制到剪贴板（复制的是完整文本，不是屏幕上被截断的那份）。
+     *
+     * 复制内容 = 判定快照 + **环境信息**。环境块只在这里拼，浮层上显示的字一个字都没变：
+     * 用户把这段贴给开发者，开发者才知道“哪个版本、哪台机器、哪个分辨率、目标 App 什么版本”。
+     * 全部信息都来自本机 `Build` / `PackageManager` / 判定快照，**没有任何网络请求**。
+     */
     private fun copyDebugText() {
         val detail = DebugTrace.detail
         if (detail.isEmpty()) {
             Toast.makeText(this, "暂无调试信息", Toast.LENGTH_SHORT).show()
             return
         }
-        val text = "#${DebugTrace.seq}\n$detail"
+        val text = "#${DebugTrace.seq}\n$detail" + buildEnvBlock()
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("ad-auto debug", text))
@@ -417,6 +430,83 @@ class FloatingBallService : Service() {
             Log.w(TAG, "copy failed: $t")
             Toast.makeText(this, "复制失败", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /**
+     * 上报用的环境信息块（只在「复制」时生成）。
+     *
+     * 刻意保持**纯文本 key=value**，方便开发者肉眼读、也方便以后脚本解析：
+     * - `app`     本 App 版本（版本号 + versionCode）
+     * - `device`  厂商 + 机型
+     * - `android` 系统版本 / SDK / ROM 版本号
+     * - `screen`  逻辑分辨率 / dpi / 横竖屏
+     * - `target`  判定时前台 App 的包名与版本（取不到就省略）
+     * - `time`    复制时刻（本地时间）
+     *
+     * 不含：页面文字、截图、已安装应用列表、设备标识（IMEI/OAID/ANDROID_ID）。
+     */
+    private fun buildEnvBlock(): String {
+        val sb = StringBuilder()
+        sb.append("\n———— 环境信息（仅你主动复制时生成，App 不会后台上传）————\n")
+        sb.append("app=").append(appVersionText()).append('\n')
+        sb.append("device=").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n')
+        sb.append("android=").append(Build.VERSION.RELEASE)
+            .append(" SDK=").append(Build.VERSION.SDK_INT)
+            .append('\n')
+        val inc = Build.VERSION.INCREMENTAL
+        val disp = Build.DISPLAY
+        sb.append("rom=").append(
+            if (disp.isNullOrEmpty() || disp == inc) inc else "$inc ($disp)",
+        ).append('\n')
+        // 屏幕用**真实物理分辨率**（`resources.displayMetrics` 会扣掉状态栏/导航栏，
+        // 报上来的是 1200x2394 这种“可用区域”，排查时分不清到底是不是这个型号）
+        val (sw, sh) = realScreenSize()
+        sb.append("screen=").append(sw).append('x').append(sh)
+            .append(" dpi=").append(resources.displayMetrics.densityDpi)
+            .append(' ').append(if (sw > sh) "横屏" else "竖屏")
+            .append('\n')
+        val target = TARGET_PKG_REGEX.find(DebugTrace.detail)?.groupValues?.getOrNull(1)
+        if (!target.isNullOrEmpty()) {
+            sb.append("target=").append(target)
+            pkgVersionName(target)?.let { sb.append(" ver=").append(it) }
+            sb.append('\n')
+        }
+        sb.append("time=").append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
+        return sb.toString()
+    }
+
+    /** 本 App 的 `版本名(versionCode)` */
+    private fun appVersionText(): String = try {
+        val pi = packageManager.getPackageInfo(packageName, 0)
+        val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pi.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            pi.versionCode.toLong()
+        }
+        "${pi.versionName ?: "?"}($code)"
+    } catch (t: Throwable) {
+        Log.w(TAG, "read app version failed: $t")
+        "?"
+    }
+
+    /** 目标 App 的版本名；未安装/读不到时返回 null（按普通做法静默省略） */
+    private fun pkgVersionName(pkg: String): String? = try {
+        packageManager.getPackageInfo(pkg, 0).versionName
+    } catch (t: Throwable) {
+        null
+    }
+
+    /** 屏幕真实分辨率（含状态栏/导航栏占用的那部分，可直接与 `wm size` 对照） */
+    private fun realScreenSize(): Pair<Int, Int> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val b = windowManager.maximumWindowMetrics.bounds
+            if (b.width() > 0 && b.height() > 0) return b.width() to b.height()
+        }
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(dm)
+        return dm.widthPixels to dm.heightPixels
     }
 
     private fun updateDebugText() {
