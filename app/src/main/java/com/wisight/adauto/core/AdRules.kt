@@ -191,6 +191,64 @@ object AdRules {
         return !hasPlaybackControls(pageText)
     }
 
+    /** “横屏全屏创意且没有任何视频层”的判定原因 */
+    const val REASON_LANDSCAPE_NO_SURFACE = "广告(横屏无视频层)"
+
+    /**
+     * “底部「∧ 上滑继续看短剧」提示栏”的判定原因（视觉判据，见 AdDetector.computeBottomHintBar）。
+     *
+     * 红果在广告/创意页底部会盖一条**纯黑底 + 居中白色小字**的提示栏，文案是「∧ 上滑继续看短剧」。
+     * 这条栏是 **App 自己的 UI**（不是广告创意），语义等于“你现在不在正剧播放页”。
+     * 但整页文字在无障碍树里读不到（创意自绘 + 该栏也被标记为不重要），
+     * 所以只能靠截图做视觉模板匹配。实测（2026-11-07 两份样本，横屏与竖屏各一）：
+     * 栏高 9.5%~10.5%、黑底占比 0.97~0.98、白字占比 0.002~0.005、
+     * 白字横向跨度 0.10~0.17（居中），而**横屏正剧没有这条栏**。
+     */
+    const val REASON_HINT_BAR_AD = "广告(底部上滑提示栏)"
+
+    /** 整页读不到字（广告创意自绘）的判定：与「稀疏树」共用同一个文字上限 */
+    fun isContentlessPage(pageText: String): Boolean = pageText.length <= SPARSE_AD_MAX_TEXT_LEN
+
+    /**
+     * 横屏全屏「试玩 / 游戏 / 落地页」广告（2026-11-07 用户样本：vivo V2329A、1280x720 横屏）。
+     *
+     * 现场特征（调试浮层实测）：
+     * `nodes=19/41 textLen=0 rv=false tex=false adItem=false surface=false scroll=true`
+     * —— 画面里有「分享 / 0:26:06 / 点击进入游戏 / 自动 / 商店 / 上滑继续看短剧」等大量文字，
+     * 但无障碍树**一个字都读不到**；也没有任何视频表面（SurfaceView/TextureView）。
+     *
+     * 判据（全部满足）：
+     * - **横屏**：[screenW] > [screenH]；
+     * - 文字总量 ≤ [SPARSE_AD_MAX_TEXT_LEN]；
+     * - 页面**没有任何视频表面**；
+     * - 没有正剧播放控件（[hasPlaybackControls]）。
+     *
+     * 依据（这是本判据成立的关键）：**正剧播放必然有视频层**。红果正剧在横屏全屏时
+     * 实测是 `43 节点 / 0 文字 / 有 SurfaceView`（也有 TextureView 的样本，见 1.71 注释），
+     * 而 SurfaceView/TextureView 是播放器视图的一部分 —— 缓冲、加载、暂停时它都还在树里。
+     * 反过来，“横屏 + 读不到文字 + 连视频层都没有”说明当前画面不是播放器渲染的：
+     * 只剩「广告创意自绘（WebView / 游戏引擎 / Canvas）」这一种解释。
+     *
+     * 与 [looksLikeSparseAdItem] 的区别（两者互补、不重叠）：
+     * - 稀疏树要求**有**视频层（创意画在视频层上），且仅竖屏；
+     * - 本条要求**没有**视频层，且仅横屏。
+     *
+     * ⚠️ 仍然是“缺失型”判据，调用方必须做**持久性确认**（AdDetector 里
+     * `LANDSCAPE_NO_SURFACE_CONFIRM_MS`）：切集、旋转、进入播放器的最初几百毫秒内，
+     * 播放器视图可能还没挂上，此时也会短暂满足。
+     */
+    fun looksLikeLandscapeAdWithoutSurface(
+        pageText: String,
+        screenW: Int,
+        screenH: Int,
+        hasVideoSurface: Boolean,
+    ): Boolean {
+        if (screenW <= 0 || screenH <= 0 || screenW <= screenH) return false
+        if (pageText.length > SPARSE_AD_MAX_TEXT_LEN) return false
+        if (hasVideoSurface) return false
+        return !hasPlaybackControls(pageText)
+    }
+
     /** “穿山甲图文/商城卡片广告”的判定原因（命名带“穿山甲广告” → 与其它穿山甲规则共享 6000ms 长冷却） */
     const val REASON_SHOP_CARD_AD = "穿山甲广告(商城卡片)"
 

@@ -161,6 +161,36 @@ class AdDetector(private val service: AccessibilityService) {
         private const val ORANGE_RETRY_MS = 1_300L
         /** 需要两张“不同截图”都命中才判定（避免视频画面偶然偏橙误判） */
         private const val ORANGE_HITS_REQUIRED = 2
+
+        /**
+         * 底部「∧ 上滑继续看短剧」提示栏的视觉判据（截图 + 亮度统计，不做 OCR）。
+         *
+         * 为什么需要：2026-11-07 用户提供的两条**游戏/试玩广告**（横屏 1280x720、竖屏各一）
+         * 创意由游戏引擎自绘，无障碍树 `textLen=0`，所有读字规则全废，而画面底部
+         * 明明盖着一条纯黑底 + 居中白字的「∧ 上滑继续看短剧」提示栏。
+         *
+         * 阈值来源（两份样本实测）：
+         * - 栏高占比 9.5% / 10.5%         → 下限 4%、上限 20%（排除系统手势条 ~1.5%、排除半屏黑）
+         * - 黑底占比 0.970 / 0.984        → 下限 0.90
+         * - 白字占比 0.0019 / 0.0047      → 区间 [0.0006, 0.10]（纯黑边 0 会被排除）
+         * - 白字横向跨度 0.17 / 0.10      → 区间 [0.05, 0.55]
+         *   （系统三键导航栏的图标横跨约 0.8，会被这一条排除）
+         * - 白字水平中心 0.54 / 0.50      → 区间 [0.30, 0.70]（提示栏文字是居中的）
+         * - **横屏正剧没有这条栏**（用户确认）→ 正剧不会被误判
+         */
+        private const val HINT_BAR_SAMPLE_STEP = 4
+        private const val HINT_BAR_ROW_DARK_MIN = 0.75f
+        private const val HINT_BAR_MIN_HEIGHT_FRAC = 0.04f
+        private const val HINT_BAR_MAX_HEIGHT_FRAC = 0.20f
+        private const val HINT_BAR_DARK_MIN = 0.90f
+        private const val HINT_BAR_BRIGHT_MIN = 0.0006f
+        private const val HINT_BAR_BRIGHT_MAX = 0.10f
+        private const val HINT_BAR_TEXT_SPAN_MIN = 0.05f
+        private const val HINT_BAR_TEXT_SPAN_MAX = 0.55f
+        private const val HINT_BAR_TEXT_CENTER_MIN = 0.30f
+        private const val HINT_BAR_TEXT_CENTER_MAX = 0.70f
+        /** 与橙色按钮一致：需要两张不同截图都命中 */
+        private const val HINT_BAR_HITS_REQUIRED = 2
         /**
          * 横屏模糊态的**自主轮询**间隔 / 次数上限。
          * 起因（2026-10-27）：横屏广告的视频层画在 surface 上、叠加文字不再刷新时，
@@ -276,6 +306,8 @@ class AdDetector(private val service: AccessibilityService) {
     private var lastCooldownNoticeAt = 0L
     /** “稀疏树广告”状态的起始时刻：用于持久性确认（0 = 当前不是该状态） */
     private var sparseAdSinceAt = 0L
+    /** “横屏无视频层广告”状态的起始时刻：用于持久性确认（0 = 当前不是该状态） */
+    private var landscapeNoSurfaceSinceAt = 0L
 
     /** 截图探测用的单线程执行器（像素统计不能放主线程） */
     private val probeExecutor = Executors.newSingleThreadExecutor()
@@ -289,6 +321,8 @@ class AdDetector(private val service: AccessibilityService) {
     @Volatile private var orangeAt = 0L
     /** 截图请求是否在飞行中（避免重复请求） */
     @Volatile private var orangeProbeInFlight = false
+    /** 本次截图是否要额外算「底部提示栏」（只有“整页读不到字”的待定态才需要，省一次全图遍历） */
+    @Volatile private var hintProbeWanted = false
     /** 上次发起截图请求的时刻（节流） */
     private var lastOrangeProbeAt = 0L
     /** 已被消费过的测量序号（同一张图不重复计命中） */
@@ -299,6 +333,16 @@ class AdDetector(private val service: AccessibilityService) {
     private var orangeRetryPending = false
     /** 已打印过日志的测量序号（同一张截图不重复刷日志） */
     private var lastLoggedOrangeSeq = 0L
+    /** 本次测量是否看到“底部「∧ 上滑继续看短剧」提示栏”（与橙色共用同一次截图） */
+    @Volatile private var hintBarHit = false
+    /** 提示栏排查用描述（栏高 / 黑底占比 / 白字占比 / 跨度 / 中心） */
+    @Volatile private var hintBarInfo = ""
+    /** 已被消费过的测量序号（同一张图不重复计命中） */
+    private var lastCountedHintSeq = 0L
+    /** 提示栏命中次数（需要两张不同截图都命中） */
+    private var hintHitCount = 0
+    /** 已打印过提示栏日志的测量序号 */
+    private var lastLoggedHintSeq = 0L
     /** 横屏模糊态剩余可轮询次数（0 = 停止轮询，等待新的无障碍事件） */
     private var landscapePollLeft = LANDSCAPE_POLL_MAX
     /** 下一次允许计一次轮询预算的时刻：内容变化事件每秒可来十几次，不加闸门会 4 秒烧完预算 */
@@ -360,6 +404,7 @@ class AdDetector(private val service: AccessibilityService) {
             pauseFlowDisabledUntil = 0L
             resetAdSwipeChain()
             sparseAdSinceAt = 0L
+            landscapeNoSurfaceSinceAt = 0L
             // 换了窗口（换广告/回正剧）：橙色探测结果与计数作废
             orangeAt = 0L
             orangeHitCount = 0
@@ -497,7 +542,8 @@ class AdDetector(private val service: AccessibilityService) {
 
         val nodes = ArrayList<AccessibilityNodeInfo>()
         val stats = NodeStats()
-        collectFromAllWindows(nodes, fgPkg, stats)
+        // 类名直方图只在调试浮层开启时统计（默认零开销）
+        collectFromAllWindows(nodes, fgPkg, stats, SettingsManager.debugOverlayEnabled)
         if (nodes.isEmpty()) {
             onResult("无障碍服务尚未就绪")
             return
@@ -519,24 +565,32 @@ class AdDetector(private val service: AccessibilityService) {
             pageText, frameW, frameH,
             stats.hasVideoSurface, stats.hasScrollableContent,
         )
+        val looksLandscapeNoSurface = AdRules.looksLikeLandscapeAdWithoutSurface(
+            pageText, frameW, frameH, stats.hasVideoSurface,
+        )
         Log.d(
             TAG,
             "scan: fg=$fgPkg nodes=${nodes.size} rawNodes=${stats.visibleNodeCount} " +
                 "textLen=${pageText.length} frame=${frameW}x$frameH " +
                 "surface=${stats.hasVideoSurface} scroll=${stats.hasScrollableContent} " +
+                "webView=${stats.hasWebView} " +
                 "renderView=$hasRenderView texView=$hasTexView adItem=$hasAdItem " +
-                "sparse=$looksSparse countdown=$countdownFound streak=$adSwipeStreak",
+                "sparse=$looksSparse landNoSurface=$looksLandscapeNoSurface " +
+                "countdown=$countdownFound streak=$adSwipeStreak",
         )
         // 调试浮层（设置页开关）：记录本次“看到了什么”。关闭时 traceBase 为空串，零开销。
         traceBase = if (SettingsManager.debugOverlayEnabled) {
             // 顶部标注当前模式：自动跳过关闭时是“仅调试·不执行”（只看不动）
             val mode = if (SettingsManager.adSkipEnabled) "" else "【仅调试·不执行】\n"
+            val cls = stats.classHistogram()
             mode +
                 "fg=$fgPkg  ${frameW}x$frameH\n" +
                 "nodes=${nodes.size}/${stats.visibleNodeCount} textLen=${pageText.length}\n" +
                 "rv=$hasRenderView tex=$hasTexView adItem=$hasAdItem\n" +
-                "sparse=$looksSparse cd=$countdownFound\n" +
-                "surface=${stats.hasVideoSurface} scroll=${stats.hasScrollableContent}"
+                "sparse=$looksSparse cd=$countdownFound landNoSurf=$looksLandscapeNoSurface\n" +
+                "surface=${stats.hasVideoSurface} scroll=${stats.hasScrollableContent} " +
+                "webView=${stats.hasWebView}" +
+                (if (cls.isEmpty()) "" else "\ncls=$cls")
         } else {
             ""
         }
@@ -563,59 +617,117 @@ class AdDetector(private val service: AccessibilityService) {
                 action = null
             }
         }
-        // 用“画面里是否有一个实心橙色按钮”来区分广告/正剧（截图 + 颜色统计，无 OCR）。
-        // 只在模糊态 & 非动作冷却期才截图；要求**两张不同截图**都命中才动手。
+        // 1) 横屏「读不到字 + 连视频层都没有」= 创意自绘（试玩/落地页广告）。
+        //    正剧横屏全屏必然有视频层（SurfaceView/TextureView），缓冲/加载/暂停时它都还在；
+        //    没有视频层说明当前画面不是播放器渲染的。详见 AdRules.looksLikeLandscapeAdWithoutSurface。
+        //    放在橙色探测之前：这类广告通常**没有橙色 CTA**（vivo 样本的 CTA 是灰白/亮绿胶囊），
+        //    橙色兜底对它无效。
+        if (action == null && fgPkg == AdRules.HONGUO_PACKAGE && looksLandscapeNoSurface) {
+            action = AdAction(
+                AdActionType.SWIPE_UP,
+                null,
+                reason = AdRules.REASON_LANDSCAPE_NO_SURFACE,
+                immediate = true,
+            )
+        }
+        // 用“画面里是否有一个实心橙色按钮 / 底部上滑提示栏”来区分广告/正剧（截图 + 统计，无 OCR）。
+        // 只在待定态 & 非动作冷却期才截图；要求**两张不同截图**都命中才动手。
         val nowOrange = SystemClock.uptimeMillis()
         // 横屏“分不出来”的状态：正剧控件被隐藏 + 没有任何可用的正向广告特征
         val landscapeAmbiguous = action == null &&
             isLandscapeAmbiguous(frameW, frameH, pageText, fgPkg)
-        if (landscapeAmbiguous && nowOrange >= nextAllowedAt) {
+        // **竖屏也有一模一样的“读不到字”全屏广告**（2026-11-07 用户样本：竖屏游戏试玩）。
+        // 所以待定态不再只限横屏：只要整页读不到字、没有正剧控件、也没命中任何规则，
+        // 就值得截一张图看看底部有没有「∧ 上滑继续看短剧」提示栏。
+        val contentlessAmbiguous = action == null &&
+            fgPkg == AdRules.HONGUO_PACKAGE &&
+            AdRules.isContentlessPage(pageText) &&
+            !AdRules.hasPlaybackControls(pageText)
+        val probeAmbiguous = landscapeAmbiguous || contentlessAmbiguous
+        if (probeAmbiguous && nowOrange >= nextAllowedAt) {
             // 结果有效期：预算内用 2.5s（及时）；预算用完（说明看着正剧很久了）降频到 8s
             val freshMs = if (landscapePollLeft > 0) ORANGE_RATIO_FRESH_MS else ORANGE_IDLE_PROBE_MS
             val fresh = orangeAt != 0L && nowOrange - orangeAt <= freshMs
             if (!fresh) {
                 // 还没有可用截图：请求一次，并在结果回来后补扫一次
-                requestOrangeProbe()
+                requestOrangeProbe(contentlessAmbiguous)
                 if (!orangeRetryPending) {
                     orangeRetryPending = true
-                    scheduleRetry(ORANGE_RETRY_MS, "橙色按钮探测")
+                    scheduleRetry(ORANGE_RETRY_MS, "截图探测")
                 }
                 recycleAll(nodes)
                 return
             }
             // 结果已被消费：允许为下一次测量再排补扫
             orangeRetryPending = false
-            if (orangeIsButton && orangeSeq != lastCountedOrangeSeq) {
-                lastCountedOrangeSeq = orangeSeq
-                orangeHitCount++
-            } else if (!orangeIsButton) {
+            // ---- 判据 A：橙色 CTA（只用于横屏策略，竖屏不用它，避免误判）----
+            if (landscapeAmbiguous) {
+                if (orangeIsButton && orangeSeq != lastCountedOrangeSeq) {
+                    lastCountedOrangeSeq = orangeSeq
+                    orangeHitCount++
+                } else if (!orangeIsButton) {
+                    orangeHitCount = 0
+                }
+                // 同一张截图只记一行日志（content change 每秒可来十几次）
+                if (orangeSeq != lastLoggedOrangeSeq) {
+                    lastLoggedOrangeSeq = orangeSeq
+                    Log.d(TAG, "横屏主策略：$orangeInfo 命中 $orangeHitCount/$ORANGE_HITS_REQUIRED")
+                    traceOutcome("橙: $orangeInfo\n命中 $orangeHitCount/$ORANGE_HITS_REQUIRED")
+                }
+                if (orangeHitCount >= ORANGE_HITS_REQUIRED) {
+                    orangeHitCount = 0
+                    orangeAt = 0L
+                    action = AdAction(
+                        AdActionType.SWIPE_UP,
+                        null,
+                        reason = AdRules.REASON_ORANGE_AD,
+                        immediate = true,
+                    )
+                }
+            } else {
                 orangeHitCount = 0
             }
-            // 同一张截图只记一行日志（content change 每秒可来十几次）
-            if (orangeSeq != lastLoggedOrangeSeq) {
-                lastLoggedOrangeSeq = orangeSeq
-                Log.d(TAG, "横屏主策略：$orangeInfo 命中 $orangeHitCount/$ORANGE_HITS_REQUIRED")
-                traceOutcome("橙: $orangeInfo\n命中 $orangeHitCount/$ORANGE_HITS_REQUIRED")
+            // ---- 判据 B：底部「∧ 上滑继续看短剧」提示栏（横竖屏通用）----
+            if (action == null && contentlessAmbiguous) {
+                if (hintBarHit && orangeSeq != lastCountedHintSeq) {
+                    lastCountedHintSeq = orangeSeq
+                    hintHitCount++
+                } else if (!hintBarHit) {
+                    hintHitCount = 0
+                }
+                if (orangeSeq != lastLoggedHintSeq) {
+                    lastLoggedHintSeq = orangeSeq
+                    Log.d(TAG, "底部提示栏：$hintBarInfo 命中 $hintHitCount/$HINT_BAR_HITS_REQUIRED")
+                    traceOutcome("栏: $hintBarInfo\n命中 $hintHitCount/$HINT_BAR_HITS_REQUIRED")
+                }
+                if (hintHitCount >= HINT_BAR_HITS_REQUIRED) {
+                    hintHitCount = 0
+                    orangeAt = 0L
+                    action = AdAction(
+                        AdActionType.SWIPE_UP,
+                        null,
+                        reason = AdRules.REASON_HINT_BAR_AD,
+                        immediate = true,
+                    )
+                }
+            } else if (!contentlessAmbiguous) {
+                hintHitCount = 0
             }
-            if (orangeHitCount >= ORANGE_HITS_REQUIRED) {
-                orangeHitCount = 0
-                orangeAt = 0L
-                action = AdAction(
-                    AdActionType.SWIPE_UP,
-                    null,
-                    reason = AdRules.REASON_ORANGE_AD,
-                    immediate = true,
+            // 命中一次：再取一张新图确认（橙色 / 提示栏共用同一套“两张图”确认）
+            val needConfirm = action == null && (
+                (landscapeAmbiguous && orangeIsButton) ||
+                    (contentlessAmbiguous && hintBarHit)
                 )
-            } else if (orangeIsButton) {
-                // 命中一次：再取一张新图确认
-                requestOrangeProbe()
+            if (needConfirm) {
+                requestOrangeProbe(contentlessAmbiguous)
                 orangeRetryPending = true
-                scheduleRetry(ORANGE_RETRY_MS, "橙色按钮确认")
+                scheduleRetry(ORANGE_RETRY_MS, "截图确认")
                 recycleAll(nodes)
                 return
             }
         } else {
             orangeHitCount = 0
+            hintHitCount = 0
         }
         // 静止广告的“续命轮询”（2026-10-27）：横屏广告的视频层画在 surface 上、叠加文字不再刷新时，
         // 无障碍**一个事件都没有**；一旦上滑补扫链结束，服务就彻底停摆
@@ -623,11 +735,11 @@ class AdDetector(private val service: AccessibilityService) {
         // 所以只要仍处于“分不出来”的模糊态且没有拿到动作，就自己定期再扫一次。
         // 预算内 1.5s 一次；预算用完后降到 8s 一次（不完全停，保证“看了很久正剧之后
         // 突然出广告”也能发现）。
-        if (landscapeAmbiguous && action == null && nowOrange >= nextLandscapePollAt) {
+        if (probeAmbiguous && action == null && nowOrange >= nextLandscapePollAt) {
             if (landscapePollLeft > 0) {
                 landscapePollLeft--
                 if (landscapePollLeft == 0) {
-                    Log.d(TAG, "横屏主策略轮询 $LANDSCAPE_POLL_MAX 次用尽，降频为 $ORANGE_IDLE_PROBE_MS ms/次")
+                    Log.d(TAG, "截图探测轮询 $LANDSCAPE_POLL_MAX 次用尽，降频为 $ORANGE_IDLE_PROBE_MS ms/次")
                 }
             }
             val wait = if (nowOrange < nextAllowedAt) {
@@ -638,7 +750,7 @@ class AdDetector(private val service: AccessibilityService) {
                 ORANGE_IDLE_PROBE_MS
             }
             nextLandscapePollAt = nowOrange + wait
-            requestOrangeProbe()
+            requestOrangeProbe(contentlessAmbiguous)
             scheduleRetry(wait, "横屏主策略轮询(剩 $landscapePollLeft)")
         }
         // “稀疏树”是缺失型判据：广告→正剧的过渡帧也会满足（实测 nodes=26~28 textLen=0，约 400ms），
@@ -784,6 +896,7 @@ class AdDetector(private val service: AccessibilityService) {
             val ok = perform(action)
             // 动作后清零：避免紧接着的“广告→正剧”过渡帧（仍满足稀疏条件）被立即再次划走
             if (action.reason == AdRules.REASON_SPARSE_AD) sparseAdSinceAt = 0L
+            if (action.reason == AdRules.REASON_LANDSCAPE_NO_SURFACE) landscapeNoSurfaceSinceAt = 0L
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             traceOutcome("→ ${action.type}（${action.reason}）${if (ok) "已执行" else "执行失败"}")
             onResult(if (ok) "检测到广告，已自动跳过（${action.reason}）" else "跳过动作执行失败")
@@ -1178,11 +1291,12 @@ class AdDetector(private val service: AccessibilityService) {
      * - 系统对截图有频率限制，这里再做 1.2s 节流 + 飞行中防重入；
      * - 像素统计放到后台线程（getPixels 按行采样），不占主线程。
      */
-    private fun requestOrangeProbe() {
+    private fun requestOrangeProbe(hintWanted: Boolean = false) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val now = SystemClock.uptimeMillis()
         if (orangeProbeInFlight || now - lastOrangeProbeAt < ORANGE_PROBE_INTERVAL_MS) return
         orangeProbeInFlight = true
+        hintProbeWanted = hintWanted
         lastOrangeProbeAt = now
         try {
             service.takeScreenshot(
@@ -1192,6 +1306,8 @@ class AdDetector(private val service: AccessibilityService) {
                     override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
                         var isButton = false
                         var info = "截图解析失败"
+                        var hint = false
+                        var hintInfo = "截图解析失败"
                         try {
                             val hw = result.hardwareBuffer
                             val bmp = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
@@ -1203,9 +1319,15 @@ class AdDetector(private val service: AccessibilityService) {
                                         "layers=${hw.layers} bmpConf=${bmp.config} " +
                                         "cs=${result.colorSpace?.name} bmpCs=${bmp.colorSpace?.name}",
                                 )
+                                // 同一次截图同时算两个判据：橙色 CTA（横屏策略）与底部提示栏（横竖屏通用）
                                 val r = computeOrangeBar(bmp)
                                 isButton = r.first
                                 info = r.second
+                                if (hintProbeWanted) {
+                                    val r2 = computeBottomHintBar(bmp)
+                                    hint = r2.first
+                                    hintInfo = r2.second
+                                }
                             }
                             try {
                                 hw.close()
@@ -1214,29 +1336,173 @@ class AdDetector(private val service: AccessibilityService) {
                         } catch (t: Throwable) {
                             Log.w(TAG, "橙色探测：解析截图失败 $t")
                         } finally {
-                            onOrangeResult(isButton, info)
+                            onOrangeResult(isButton, info, hint, hintInfo)
                         }
                     }
 
                     override fun onFailure(errorCode: Int) {
                         Log.w(TAG, "橙色探测：截图失败 code=$errorCode")
-                        onOrangeResult(false, "截图失败 code=$errorCode")
+                        onOrangeResult(false, "截图失败 code=$errorCode", false, "截图失败")
                     }
                 },
             )
         } catch (t: Throwable) {
             Log.w(TAG, "橙色探测：调用截图异常 $t")
-            onOrangeResult(false, "调用截图异常")
+            onOrangeResult(false, "调用截图异常", false, "调用截图异常")
         }
     }
 
-    private fun onOrangeResult(isButton: Boolean, info: String) {
+    private fun onOrangeResult(
+        isButton: Boolean,
+        info: String,
+        hint: Boolean = false,
+        hintInfo: String = "",
+    ) {
         orangeIsButton = isButton
         orangeInfo = info
+        hintBarHit = hint
+        this.hintBarInfo = hintInfo
         orangeSeq++
         orangeAt = SystemClock.uptimeMillis()
         orangeProbeInFlight = false
     }
+
+    /**
+     * 把（可能是 HARDWARE / Display-P3 的）截图统一转成**软件 ARGB_8888 + sRGB** 位图。
+     * 调用方负责 `recycle()`；失败返回 null。
+     *
+     * **关键**：无障碍截图可能带 Display P3（广色域）原始像素（手机实测），也可能是 sRGB
+     * （平板实测）。P3 不转色域就直接比色，同一根橙色按钮会显得“颜色很散”
+     * （±12 纯度 0.68 vs screencap 0.998）。所以统一转成 sRGB 再分析。
+     *
+     * ⚠️ 顺序很重要：必须**先 copy 成软件位图**，再画到 sRGB 画布。
+     * 软件 Canvas 不能直接画 HARDWARE 位图 —— 小米平板 5 / Android 13 实测抛
+     * `IllegalArgumentException: Software rendering doesn't support hardware bitmaps`，
+     * 而之前的实现正是先 Canvas 后 copy，导致平板上一路退回原图（色域没统一）。
+     */
+    private fun toSoftwareSrgb(src: Bitmap): Bitmap? {
+        val srgb = ColorSpace.get(ColorSpace.Named.SRGB)
+        val soft = try {
+            src.copy(Bitmap.Config.ARGB_8888, false)
+        } catch (t: Throwable) {
+            Log.w(TAG, "copy bitmap 失败：$t")
+            return null
+        } ?: return null
+        if (soft.colorSpace == srgb) return soft
+        return try {
+            val out = Bitmap.createBitmap(
+                soft.width,
+                soft.height,
+                Bitmap.Config.ARGB_8888,
+                false,
+                srgb,
+            )
+            Canvas(out).drawBitmap(soft, 0f, 0f, null)
+            soft.recycle()
+            out
+        } catch (t: Throwable) {
+            Log.w(TAG, "转 sRGB 失败，退回原图（${soft.colorSpace}）：$t")
+            soft
+        }
+    }
+
+    /**
+     * 判断画面底部是否存在「∧ 上滑继续看短剧」那种**纯黑底 + 居中白字**的提示栏。
+     *
+     * 为什么需要视觉判据：游戏/试玩广告的创意由引擎自绘，整页 `textLen=0`，
+     * 而这条提示栏是 App 自己的 UI（即使 uiautomator 能看到文字，无障碍服务也读不到）。
+     * 详见 AdRules.REASON_HINT_BAR_AD 与 HINT_BAR_* 常量的阈值来源。
+     *
+     * 算法（自底向上，单遍）：
+     * 1. 逐行统计暗像素（亮度<70）与亮像素（亮度>200）占比；
+     * 2. 只要该行暗占比 ≥ [HINT_BAR_ROW_DARK_MIN] 就并入提示栏，否则说明栏顶到了；
+     * 3. 校验栏高/黑底/白字占比/白字横向跨度与中心。
+     *
+     * @return first = 是否命中，second = 排查用描述
+     */
+    private fun computeBottomHintBar(src: Bitmap): Pair<Boolean, String> {
+        val sw = toSoftwareSrgb(src) ?: return false to "copy bitmap 失败"
+        try {
+            val w = sw.width
+            val h = sw.height
+            if (w <= 0 || h <= 0) return false to "截图尺寸异常"
+            val step = HINT_BAR_SAMPLE_STEP
+            val row = IntArray(w)
+            var cells = 0
+            var darkCells = 0
+            var brightCells = 0
+            var minBx = Int.MAX_VALUE
+            var maxBx = -1
+            var bandTop = h
+            // 栏高上限对应的行数：超过就停（也顺带避免整屏黑时白扫一遍）
+            val maxBandPx = (h * HINT_BAR_MAX_HEIGHT_FRAC).toInt()
+            var y = h - 1
+            while (y >= 0 && h - y <= maxBandPx) {
+                sw.getPixels(row, 0, w, 0, y, w, 1)
+                var rowDark = 0
+                var rowN = 0
+                var rowBright = 0
+                var rowMinBx = Int.MAX_VALUE
+                var rowMaxBx = -1
+                for (x in 0 until w step step) {
+                    val c = row[x]
+                    val r = (c shr 16) and 0xFF
+                    val g = (c shr 8) and 0xFF
+                    val b = c and 0xFF
+                    val lum = 0.299f * r + 0.587f * g + 0.114f * b
+                    rowN++
+                    if (lum < 70f) {
+                        rowDark++
+                    } else if (lum > 200f) {
+                        rowBright++
+                        if (x < rowMinBx) rowMinBx = x
+                        if (x > rowMaxBx) rowMaxBx = x
+                    }
+                }
+                // ⚠️ 必须先判定“这一行是否属于提示栏”，再累加统计：
+                // 否则把栏顶上方那行彩色内容的亮像素也算进来，会让“白字跨度”爆到 0.5+，
+                // 把真正的提示栏判成 miss（2026-11-07 样本复刻时实测到的 bug）。
+                if (rowN == 0 || rowDark.toFloat() / rowN < HINT_BAR_ROW_DARK_MIN) break
+                darkCells += rowDark
+                brightCells += rowBright
+                if (rowMaxBx > rowMinBx) {
+                    if (rowMinBx < minBx) minBx = rowMinBx
+                    if (rowMaxBx > maxBx) maxBx = rowMaxBx
+                }
+                cells += rowN
+                bandTop = y
+                y -= step
+            }
+            if (cells == 0) return false to "底部无黑色栏"
+            val bandH = h - bandTop
+            val hFrac = bandH.toFloat() / h
+            val darkFrac = darkCells.toFloat() / cells
+            val brightFrac = brightCells.toFloat() / cells
+            val span = if (maxBx > minBx) (maxBx - minBx).toFloat() / w else 0f
+            val center = if (maxBx > minBx) ((maxBx + minBx) / 2f) / w else 0f
+            val desc = "栏高 ${fmtPct(hFrac)} 黑 ${fmt2(darkFrac)} 白 ${fmt4(brightFrac)} " +
+                "跨度 ${fmt2(span)} 中心 ${fmt2(center)}"
+            val hit = hFrac >= HINT_BAR_MIN_HEIGHT_FRAC &&
+                hFrac <= HINT_BAR_MAX_HEIGHT_FRAC &&
+                darkFrac >= HINT_BAR_DARK_MIN &&
+                brightFrac >= HINT_BAR_BRIGHT_MIN &&
+                brightFrac <= HINT_BAR_BRIGHT_MAX &&
+                span >= HINT_BAR_TEXT_SPAN_MIN &&
+                span <= HINT_BAR_TEXT_SPAN_MAX &&
+                center >= HINT_BAR_TEXT_CENTER_MIN &&
+                center <= HINT_BAR_TEXT_CENTER_MAX
+            return hit to desc
+        } catch (t: Throwable) {
+            Log.w(TAG, "提示栏探测：解析截图失败 $t")
+            return false to "提示栏解析失败"
+        } finally {
+            sw.recycle()
+        }
+    }
+
+    private fun fmt2(v: Float): String = String.format("%.2f", v)
+    private fun fmt4(v: Float): String = String.format("%.4f", v)
+    private fun fmtPct(v: Float): String = String.format("%.1f%%", v * 100f)
 
     /**
      * 判断画面里是否有一个“实心橙色宽条”（= 广告 CTA 按钮）。
@@ -1249,40 +1515,7 @@ class AdDetector(private val service: AccessibilityService) {
      * @return first = 是否判定为按钮，second = 排查用描述
      */
     private fun computeOrangeBar(src: Bitmap): Pair<Boolean, String> {
-        // **关键**：无障碍截图可能带 Display P3（广色域）原始像素（手机实测），也可能是 sRGB
-        // （平板实测）。P3 不转色域就直接比色，同一根橙色按钮会显得“颜色很散”
-        // （±12 纯度 0.68 vs screencap 0.998）。所以统一转成 sRGB 再分析。
-        //
-        // ⚠️ 顺序很重要：必须**先 copy 成软件位图**，再画到 sRGB 画布。
-        // 软件 Canvas 不能直接画 HARDWARE 位图 —— 小米平板 5 / Android 13 实测抛
-        // `IllegalArgumentException: Software rendering doesn't support hardware bitmaps`，
-        // 而之前的实现正是先 Canvas 后 copy，导致平板上一路退回原图（色域没统一）。
-        val srgb = ColorSpace.get(ColorSpace.Named.SRGB)
-        val soft = try {
-            src.copy(Bitmap.Config.ARGB_8888, false)
-        } catch (t: Throwable) {
-            Log.w(TAG, "copy bitmap 失败：$t")
-            null
-        } ?: return false to "copy bitmap 失败"
-        val sw = if (soft.colorSpace == srgb) {
-            soft
-        } else {
-            try {
-                val out = Bitmap.createBitmap(
-                    soft.width,
-                    soft.height,
-                    Bitmap.Config.ARGB_8888,
-                    false,
-                    srgb,
-                )
-                Canvas(out).drawBitmap(soft, 0f, 0f, null)
-                soft.recycle()
-                out
-            } catch (t: Throwable) {
-                Log.w(TAG, "转 sRGB 失败，退回原图（${soft.colorSpace}）：$t")
-                soft
-            }
-        }
+        val sw = toSoftwareSrgb(src) ?: return false to "copy bitmap 失败"
         try {
             val w = sw.width
             val h = sw.height
@@ -1660,19 +1893,34 @@ class AdDetector(private val service: AccessibilityService) {
      * 一次节点遍历的统计信息。
      * - [visibleNodeCount]：**过滤前**的可见节点数（排查用，也用于日志对比口径）；
      * - [hasVideoSurface]：页面是否挂了视频表面（SurfaceView/TextureView）；
-     * - [hasScrollableContent]：页面是否有可滚动容器（列表 / 网格 / ViewPager）。
-     *   它们通常没有 id/文字，会被 [collectNodes] 丢弃，所以只能在遍历时额外记录。
+     * - [hasScrollableContent]：页面是否有可滚动容器（列表 / 网格 / ViewPager）；
+     * - [hasWebView]：页面是否有 WebView（试玩/落地页广告常用它渲染创意，正剧不用）；
+     * - [classCounts]：**过滤前**各类名的计数（仅调试浮层开启时统计）——
+     *   “画面有内容却读不到一个字”时，只有类名能说明创意到底是用什么渲染的。
+     *   这些信息在过滤后的节点列表里拿不到，所以只能在遍历时记录。
      */
     private class NodeStats {
         var visibleNodeCount = 0
         var hasVideoSurface = false
         var hasScrollableContent = false
+        var hasWebView = false
+        val classCounts = HashMap<String, Int>()
+
+        /** 类名直方图（降序、去掉包名前缀），供调试浮层/日志用 */
+        fun classHistogram(limit: Int = 6): String {
+            if (classCounts.isEmpty()) return ""
+            return classCounts.entries
+                .sortedByDescending { it.value }
+                .take(limit)
+                .joinToString(",") { "${it.key}×${it.value}" }
+        }
     }
 
     private fun collectNodes(
         root: AccessibilityNodeInfo,
         out: MutableList<AccessibilityNodeInfo>,
         stats: NodeStats,
+        collectClasses: Boolean,
     ) {
         val stack = ArrayDeque<AccessibilityNodeInfo>()
         stack.add(root)
@@ -1683,8 +1931,18 @@ class AdDetector(private val service: AccessibilityService) {
             if (!node.isVisibleToUser) continue
             stats.visibleNodeCount++
             val cls = node.className?.toString().orEmpty()
-            if (cls.contains("SurfaceView") || cls.contains("TextureView")) {
+            if (cls.contains("SurfaceView") || cls.contains("TextureView") ||
+                cls.contains("VideoView")
+            ) {
                 stats.hasVideoSurface = true
+            }
+            if (cls.contains("WebView")) {
+                stats.hasWebView = true
+            }
+            if (collectClasses && cls.isNotEmpty()) {
+                // 只留简单类名（android.widget.FrameLayout → FrameLayout），避免日志过长
+                val simple = cls.substringAfterLast('.')
+                stats.classCounts[simple] = (stats.classCounts[simple] ?: 0) + 1
             }
             if (node.isScrollable) {
                 stats.hasScrollableContent = true
@@ -1717,6 +1975,7 @@ class AdDetector(private val service: AccessibilityService) {
         out: MutableList<AccessibilityNodeInfo>,
         fgPkg: String,
         stats: NodeStats,
+        collectClasses: Boolean = false,
     ) {
         val windows = try {
             service.windows
@@ -1732,11 +1991,11 @@ class AdDetector(private val service: AccessibilityService) {
             // 跳过系统界面/自身窗口：通知栏里会出现我们的通知文案，避免误判成广告点击
             if (pkg in NON_AD_PACKAGES) continue
             if (!win.isActive && pkg != fgPkg) continue
-            collectNodes(root, out, stats)
+            collectNodes(root, out, stats, collectClasses)
         }
         // 兜底：某些设备上 windows 列表为空时退回活动窗口
         if (out.isEmpty()) {
-            service.rootInActiveWindow?.let { collectNodes(it, out, stats) }
+            service.rootInActiveWindow?.let { collectNodes(it, out, stats, collectClasses) }
         }
     }
 

@@ -140,8 +140,9 @@ adb shell settings put secure accessibility_enabled 1
 fg=com.phoenix.read  1200x2670
 nodes=85/117 textLen=92
 rv=false tex=false adItem=false
-sparse=false cd=false
-surface=true scroll=true
+sparse=false cd=false landNoSurf=false
+surface=true scroll=true webView=false
+cls=FrameLayout×38,ViewGroup×21,ImageView×9,TextView×6
 → 未命中任何广告规则
 ———— 环境信息（仅你主动复制时生成，App 不会后台上传）————
 app=1.2.4(10204)
@@ -166,6 +167,32 @@ time=2026-11-04 11:19:47
 - **调试浮层开着时一定会检测**（哪怕"自动跳过"是关的），但不会动手 ——
   浮层会标注 `【仅调试·不执行】`，方便"只看不改"地观察。
 - 不需要了就把开关关掉，浮层和它的检测负担一起消失。
+
+**各字段含义**（发反馈时不用解释，我们看得懂）：
+
+| 字段 | 含义 |
+|---|---|
+| `nodes=A/B` | A = 过滤后有特征的节点数，B = **过滤前的可见节点总数** |
+| `textLen` | 无障碍树里能读到的文字总量（**0 = 创意是自绘的，读不到任何字**） |
+| `rv` / `tex` / `adItem` | 直播渲染视图 / 无 id 的 TextureView / 广告 item 容器（`ay0`+`i0t`） |
+| `sparse` | 竖屏“稀疏树”兜底判据 |
+| `cd` | 是否读到广告倒计时 |
+| `surface` | 页面是否有视频层（SurfaceView/TextureView/VideoView） |
+| `scroll` | 页面是否有可滚动容器（列表/网格/ViewPager） |
+| `webView` | 页面是否有 WebView（试玩/落地页广告常用） |
+| `landNoSurf` | 横屏「读不到字 + 连视频层都没有」判据 |
+| `cls` | 类名直方图（**只在开浮层时统计**）——用来判断创意到底怎么渲染的 |
+
+**两条不读文字的兜底判据**（都在截图后台线程做像素统计，不做 OCR）：
+
+1. **横屏无视频层**：横屏 + `textLen≈0` + `surface=false`。
+   正剧播放必然有视频层（缓冲/加载/暂停时它都在），没有视频层说明画面不是播放器渲染的。
+2. **底部「∧ 上滑继续看短剧」提示栏**：画面底部有纯黑底 + 居中白字的提示栏。
+   这条栏是 App 自己的 UI，等于"你现在不在正剧播放页"，但文字读不到，只能视觉识别。
+   实测阈值：栏高 4%~20%、黑底 ≥0.90、白字占比 0.0006~0.10、
+   白字横向跨度 0.05~0.55 且水平居中（系统三键导航栏图标跨度约 0.8，会被排除）。
+   **横屏正剧没有这条栏**，因此不会误判。
+   判定需**两张不同截图都命中**，与橙色按钮判据一致。
 
 ---
 
