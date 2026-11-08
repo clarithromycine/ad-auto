@@ -169,26 +169,43 @@ class AdDetector(private val service: AccessibilityService) {
          * 创意由游戏引擎自绘，无障碍树 `textLen=0`，所有读字规则全废，而画面底部
          * 明明盖着一条纯黑底 + 居中白字的「∧ 上滑继续看短剧」提示栏。
          *
-         * 阈值来源（两份样本实测）：
-         * - 栏高占比 9.5% / 10.5%         → 下限 4%、上限 20%（排除系统手势条 ~1.5%、排除半屏黑）
-         * - 黑底占比 0.970 / 0.984        → 下限 0.90
+         * ⚠️ **2026-11-08 修正（横屏正剧被划走）**：这条判据曾用「栏高 ≤20%、黑 ≥0.90」，
+         * 结果在横屏正剧上误判 —— 实测现场 `栏高 19.8% 黑 0.91 白 0.0096 跨度 0.12 中心 0.50`
+         * 五条全部擦边通过。那条 19.8% 的"黑带"其实是**暗场景视频内容 + 居中白色字幕**：
+         * 字幕烧在视频帧里，无障碍读不到（所以 `textLen=0` 挡不住），像素统计却和提示栏一模一样。
+         * 现在加两道护栏：
+         * 1. **必须有视频层的页面才不参判** —— 由调用方保证（见 contentlessAmbiguous）：
+         *    正剧播放必然挂 SurfaceView/TextureView，提示栏只出现在自绘创意上；
+         * 2. 阈值收紧：栏高上限 0.20→**0.14**、黑底下限 0.90→**0.95**
+         *    （广告实测 9.5%/10.5%、0.970/0.984；正剧误判帧 19.8%、0.91）。
+         *
+         * 阈值来源（两份广告样本实测）：
+         * - 栏高占比 9.5% / 10.5%         → 区间 [4%, 14%]（排除系统手势条 ~1.5%、排除字幕黑区 ~20%）
+         * - 黑底占比 0.970 / 0.984        → 下限 0.95
          * - 白字占比 0.0019 / 0.0047      → 区间 [0.0006, 0.10]（纯黑边 0 会被排除）
          * - 白字横向跨度 0.17 / 0.10      → 区间 [0.05, 0.55]
          *   （系统三键导航栏的图标横跨约 0.8，会被这一条排除）
          * - 白字水平中心 0.54 / 0.50      → 区间 [0.30, 0.70]（提示栏文字是居中的）
-         * - **横屏正剧没有这条栏**（用户确认）→ 正剧不会被误判
          */
         private const val HINT_BAR_SAMPLE_STEP = 4
         private const val HINT_BAR_ROW_DARK_MIN = 0.75f
         private const val HINT_BAR_MIN_HEIGHT_FRAC = 0.04f
-        private const val HINT_BAR_MAX_HEIGHT_FRAC = 0.20f
-        private const val HINT_BAR_DARK_MIN = 0.90f
+        private const val HINT_BAR_MAX_HEIGHT_FRAC = 0.14f
+        private const val HINT_BAR_DARK_MIN = 0.95f
         private const val HINT_BAR_BRIGHT_MIN = 0.0006f
         private const val HINT_BAR_BRIGHT_MAX = 0.10f
         private const val HINT_BAR_TEXT_SPAN_MIN = 0.05f
         private const val HINT_BAR_TEXT_SPAN_MAX = 0.55f
         private const val HINT_BAR_TEXT_CENTER_MIN = 0.30f
         private const val HINT_BAR_TEXT_CENTER_MAX = 0.70f
+        /**
+         * 底色纯度：只统计暗像素，按 4bit/通道量化（16×16×16 = 4096 桶），
+         * 要求主色桶占比 ≥ 该值。提示栏是 App 画的纯色 UI 条（实测 0.99、5 个桶），
+         * 暗场景视频是渐变+噪点（实测 0.48~0.51、40+ 个桶）。
+         * 竖屏广告样本经聊天软件二次压缩后降到 0.716，所以阈值取 0.65，两侧都留余量。
+         */
+        private const val HINT_BAR_DOMINANT_MIN = 0.65f
+        private const val HINT_BAR_HISTOGRAM_BUCKETS = 4096
         /** 与橙色按钮一致：需要两张不同截图都命中 */
         private const val HINT_BAR_HITS_REQUIRED = 2
         /**
@@ -639,9 +656,16 @@ class AdDetector(private val service: AccessibilityService) {
         // **竖屏也有一模一样的“读不到字”全屏广告**（2026-11-07 用户样本：竖屏游戏试玩）。
         // 所以待定态不再只限横屏：只要整页读不到字、没有正剧控件、也没命中任何规则，
         // 就值得截一张图看看底部有没有「∧ 上滑继续看短剧」提示栏。
+        //
+        // ⚠️ **必须要求“没有视频层”**（2026-11-08 修正）：横屏正剧实测
+        // `surface=true textLen=0`，而底部暗场景画面 + 烧在视频帧里的居中白色字幕，
+        // 像素统计与提示栏完全撞车（栏高 19.8% / 黑 0.91 / 白 0.0096 / 中心 0.50），
+        // 导致正剧被反复划走。正剧播放**必然**挂 SurfaceView/TextureView，
+        // 提示栏只出现在“创意自绘、没有任何视频层”的页面上 —— 用这个结构差异把它彻底隔开。
         val contentlessAmbiguous = action == null &&
             fgPkg == AdRules.HONGUO_PACKAGE &&
             AdRules.isContentlessPage(pageText) &&
+            !stats.hasVideoSurface &&
             !AdRules.hasPlaybackControls(pageText)
         val probeAmbiguous = landscapeAmbiguous || contentlessAmbiguous
         if (probeAmbiguous && nowOrange >= nextAllowedAt) {
@@ -1480,11 +1504,40 @@ class AdDetector(private val service: AccessibilityService) {
             val brightFrac = brightCells.toFloat() / cells
             val span = if (maxBx > minBx) (maxBx - minBx).toFloat() / w else 0f
             val center = if (maxBx > minBx) ((maxBx + minBx) / 2f) / w else 0f
+            // **底色纯度**（2026-11-08 用户提出）：提示栏是 App 画的 UI 条，底色是**同一个纯色**；
+            // 而暗场景视频内容是渐变 + 噪点，颜色会散落在很多个桶里。
+            // 只统计暗像素（排除白字/抗锯齿），按 4bit/通道（4096 桶）量化后取主色桶占比。
+            // 实测：横屏广告 0.993（5 个桶）、竖屏广告(经聊天软件二次压缩) 0.716（47 个桶）、
+            //       横屏正剧底部暗画面 0.484~0.511（39~45 个桶）→ 阈值取 0.65，两侧都有余量。
+            val buckets = IntArray(HINT_BAR_HISTOGRAM_BUCKETS)
+            var darkSamples = 0
+            var topBucketCount = 0
+            var distinctBuckets = 0
+            var yy = bandTop
+            while (yy < h) {
+                sw.getPixels(row, 0, w, 0, yy, w, 1)
+                for (x in 0 until w step step) {
+                    val c = row[x]
+                    val r = (c shr 16) and 0xFF
+                    val g = (c shr 8) and 0xFF
+                    val b = c and 0xFF
+                    if (0.299f * r + 0.587f * g + 0.114f * b >= 70f) continue
+                    val idx = ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
+                    if (buckets[idx] == 0) distinctBuckets++
+                    val n = ++buckets[idx]
+                    if (n > topBucketCount) topBucketCount = n
+                    darkSamples++
+                }
+                yy += step
+            }
+            val dominant = if (darkSamples > 0) topBucketCount.toFloat() / darkSamples else 0f
             val desc = "栏高 ${fmtPct(hFrac)} 黑 ${fmt2(darkFrac)} 白 ${fmt4(brightFrac)} " +
-                "跨度 ${fmt2(span)} 中心 ${fmt2(center)}"
+                "跨度 ${fmt2(span)} 中心 ${fmt2(center)} " +
+                "主色 ${fmt2(dominant)}($distinctBuckets 桶)"
             val hit = hFrac >= HINT_BAR_MIN_HEIGHT_FRAC &&
                 hFrac <= HINT_BAR_MAX_HEIGHT_FRAC &&
                 darkFrac >= HINT_BAR_DARK_MIN &&
+                dominant >= HINT_BAR_DOMINANT_MIN &&
                 brightFrac >= HINT_BAR_BRIGHT_MIN &&
                 brightFrac <= HINT_BAR_BRIGHT_MAX &&
                 span >= HINT_BAR_TEXT_SPAN_MIN &&
