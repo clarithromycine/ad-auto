@@ -18,8 +18,8 @@ android {
         applicationId "com.wisight.adauto"
         minSdk 26
         targetSdk 34
-        versionCode 10208
-        versionName "1.2.8"
+        versionCode 10210
+        versionName "1.2.10"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -176,6 +176,10 @@ object AdRules {
      *
      * @param hasVideoSurface 页面是否有 SurfaceView/TextureView；纯图片列表页没有视频表面。
      * @param hasScrollableContent 页面是否有可滚动容器；内容列表页一定有，全屏广告创意没有。
+     *   ⚠️ 2026-11-11：这条**保持硬否决**，不跟随 1.71（TextureView）放开 ——
+     *   本判据用的是 `hasVideoSurface`（SurfaceView **或** TextureView），而竖屏正剧全屏播放时
+     *   正是「SurfaceView + 控件隐藏 + 常读不到字」，放开 scroll 闸门会直接误划正剧。
+     *   红果 7.4.x 的 ViewPager 型广告由 1.71 的 TextureView 分支负责。
      */
     fun looksLikeSparseAdItem(
         pageText: String,
@@ -251,6 +255,10 @@ object AdRules {
      * ⚠️ 仍然是“缺失型”判据，调用方必须做**持久性确认**（AdDetector 里
      * `LANDSCAPE_NO_SURFACE_CONFIRM_MS`）：切集、旋转、进入播放器的最初几百毫秒内，
      * 播放器视图可能还没挂上，此时也会短暂满足。
+     *
+     * ⚠️ **2026-11-11 停用**：三星 SM-S9280 / Android 15 / 红果 7.1.1.32 实测**正在播正剧**时
+     * 也满足全部条件（`textLen=24 surface=false`），正剧被划走。本判据已由
+     * `AdDetector.LANDSCAPE_NO_SURFACE_ENABLED = false` 关闭，函数保留仅供调试浮层显示特征。
      */
     fun looksLikeLandscapeAdWithoutSurface(
         pageText: String,
@@ -533,8 +541,14 @@ object AdRules {
         //   能读到 60~130 字。实测误判：从短剧播放页退出到「新剧推荐」时，
         //   `collectFromAllWindows` 会把**同包名、非活动**的旧窗口节点一并收进来，
         //   那些节点带着 `TextureView` + 61 字文本 → 被本分支当成广告，静置时莫名上滑两次。
+        //   ⚠️ 2026-11-11 修正——**“可滚动”不再硬否决**：红果 7.4.x 的整页翻页容器是
+        //   `ViewPager`（`isScrollable=true`），全屏创意就装在它里面，于是 `!hasScrollableContent`
+        //   把这整类广告（包括 2026-11-09 那条直播电商、11-11 那条竖屏游戏）全部卡死。
+        //   新规则：**只有“页面能读到文字”时，可滚动容器才当作“这是内容列表页”的否决理由**。
+        //   列表页的特征本来就有文字（标题/简介/评论），而创意自绘页面是 0 字。
+        //   当年加 `!scrollable` 要挡的“新剧推荐页”是 61 字，照样被 `textLen ≤ 30` 挡住。
         if (isHonguo && isPortrait && pageText.length <= SPARSE_AD_MAX_TEXT_LEN &&
-            !hasScrollableContent && hasAdRenderSurface(nodes)
+            !(hasScrollableContent && pageText.isNotEmpty()) && hasAdRenderSurface(nodes)
         ) {
             val surface = nodes.firstOrNull {
                 it.className?.toString()?.contains(AD_RENDER_VIEW_CLASS) == true

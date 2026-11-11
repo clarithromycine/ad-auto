@@ -315,6 +315,21 @@ class AdDetector(private val service: AccessibilityService) {
         private const val LANDSCAPE_IGNORE_RENDER_VIEW = true
 
         /**
+         * 「横屏无视频层」判据（[AdRules.REASON_LANDSCAPE_NO_SURFACE]）总开关。
+         *
+         * **2026-11-11 起关闭**（用户决定，方案 A）。原因：这条判据的四个条件全是
+         * 「读不到 / 没有」型（横屏 && 文字≤30 && 无视频层 && 读不到播放控件），
+         * 而三星 SM-S9280 / Android 15 / 红果 7.1.1.32 实测**正在播正剧**时全部满足 →
+         * 正剧被直接上滑划走（`frame=2340x1080 textLen=24 surface=false scroll=true`,
+         * rv/tex/adItem/cd 全 false）。
+         *
+         * 它只有 1 个验证样本（vivo V2329A 1280x720 全屏试玩广告），误判代价却是划走正剧，
+         * 因此按「宁漏勿误划」停用。若要恢复，必须补**正向**锚点（例如画面里确实存在
+         * 自绘创意的特征），而不是继续加「没有…」的闸门。
+         */
+        private const val LANDSCAPE_NO_SURFACE_ENABLED = false
+
+        /**
          * 悬浮球正在被拖动：拖动期间暂停广告检测，避免检测占用主线程导致拖动卡顿。
          * 拖动结束后由悬浮球触发一次补扫。
          */
@@ -707,11 +722,18 @@ class AdDetector(private val service: AccessibilityService) {
             }
         }
         // 1) 横屏「读不到字 + 连视频层都没有」= 创意自绘（试玩/落地页广告）。
-        //    正剧横屏全屏必然有视频层（SurfaceView/TextureView），缓冲/加载/暂停时它都还在；
-        //    没有视频层说明当前画面不是播放器渲染的。详见 AdRules.looksLikeLandscapeAdWithoutSurface。
-        //    放在橙色探测之前：这类广告通常**没有橙色 CTA**（vivo 样本的 CTA 是灰白/亮绿胶囊），
-        //    橙色兜底对它无效。
-        if (action == null && fgPkg == AdRules.HONGUO_PACKAGE && looksLandscapeNoSurface) {
+        //    ⚠️ **2026-11-11 已停用（LANDSCAPE_NO_SURFACE_ENABLED = false）**：
+        //    三星 SM-S9280 / Android 15 / 红果 7.1.1.32 实测**正在播正剧**时也满足全部条件
+        //    （`frame=2340x1080 textLen=24 surface=false scroll=true`，且 rv/tex/adItem/cd 全 false
+        //    → AdRules.match 返回 null → 由本条兜底判据直接上滑），正剧被划走。
+        //    根因：这条判据的四个条件全是「读不到 / 没有」型，而红果横屏全屏时**既会隐藏播放控件、
+        //    也可能没有可导出的视频层**，于是它对正剧和广告同时成立 —— 没有区分力。
+        //    经验教训：缺失型条件只允许用于「进入截图探测」，不允许用于「直接执行动作」。
+        //    代价：vivo 1280x720 那类「自绘全屏试玩广告」会漏判（无橙色 CTA、铺满无信箱特征），
+        //    按「宁漏勿误划」接受。将来若要恢复，必须补一条**正向**锚点而不是加闸门。
+        if (LANDSCAPE_NO_SURFACE_ENABLED && action == null &&
+            fgPkg == AdRules.HONGUO_PACKAGE && looksLandscapeNoSurface
+        ) {
             action = AdAction(
                 AdActionType.SWIPE_UP,
                 null,
