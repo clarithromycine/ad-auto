@@ -308,11 +308,12 @@ class AdDetector(private val service: AccessibilityService) {
          *   挂在屏幕上 **3 分钟以上**（角标判据被忽略）—— 单策略一旦失效就是全失效。
          * - 角标 `desc="广告"` 比截图判定快 2~3s（同一广告：角标 11:49:50.8 可见、橙色 11:49:53.7 才确认）。
          *
-         * 所以最终策略：**保留角标快路径 + 橙色作主策略**，只把真正有风险的
-         * “渲染视图”类判据在横屏禁用（SDK 渲染视图可能残留、与正剧共存，
-         * 而横屏读不到文字使得 `hasPlaybackControls` 保护失效）。
+         * 所以最终策略：**保留角标快路径 + 橙色作主策略**。
+         *
+         * 注：曾有一个 `LANDSCAPE_IGNORE_RENDER_VIEW` 开关（横屏时丢弃“渲染视图”判据），
+         * 2026-11-11 已移除 —— 它把 5 份正剧样本都不具备的 `ttlive_player_render_view`
+         * 也一起挡掉了，改为用 `liveAdSinceAt` 做 800ms 持久化确认（见 detectAndAct）。
          */
-        private const val LANDSCAPE_IGNORE_RENDER_VIEW = true
 
         /**
          * 「横屏无视频层」判据（[AdRules.REASON_LANDSCAPE_NO_SURFACE]）总开关。
@@ -398,6 +399,8 @@ class AdDetector(private val service: AccessibilityService) {
     private var lastCooldownNoticeAt = 0L
     /** “稀疏树广告”状态的起始时刻：用于持久性确认（0 = 当前不是该状态） */
     private var sparseAdSinceAt = 0L
+    /** “直播渲染视图广告”状态的起始时刻：用于持久性确认（0 = 当前不是该状态） */
+    private var liveAdSinceAt = 0L
     /** “横屏无视频层广告”状态的起始时刻：用于持久性确认（0 = 当前不是该状态） */
     private var landscapeNoSurfaceSinceAt = 0L
 
@@ -694,6 +697,7 @@ class AdDetector(private val service: AccessibilityService) {
                 "sparse=$looksSparse cd=$countdownFound landNoSurf=$looksLandscapeNoSurface\n" +
                 "surface=${stats.hasVideoSurface} scroll=${stats.hasScrollableContent} " +
                 "webView=${stats.hasWebView}" +
+                (if (pillarInfo.isEmpty()) "" else "\n柱(上次) $pillarInfo") +
                 (if (cls.isEmpty()) "" else "\ncls=$cls")
         } else {
             ""
@@ -702,24 +706,24 @@ class AdDetector(private val service: AccessibilityService) {
             nodes, pageText, frameW, frameH, fgPkg,
             stats.hasVideoSurface, stats.hasScrollableContent,
         )
-        // **横屏策略（2026-10-31 修正）**：1.0.16 曾在这里无条件丢弃“渲染视图”判据，
-        // 结果在小米平板 5 上翻车：实测那条直播样式的广告 `renderView=true adItem=true`，
-        // 而 `AdRules.match` 只返回**第一个**命中的分支（渲染视图），丢弃后不会继续去试
-        // “广告容器”，可这条广告橙色占比只有 0.11%（没有橙色 CTA）→ 三个信号全废 → 跳不过。
-        // 现在改成：只有当**没有别的独立正向证据**（广告容器/角标/上滑关键字）时才丢弃渲染视图，
-        // 保留“渲染视图残留、横屏误划正剧”的防护，同时不会把真广告漏掉。
-        if (action != null && LANDSCAPE_IGNORE_RENDER_VIEW && frameW > frameH &&
+        // **横屏策略（2026-11-11 简化）**：这里原来有一段“有条件丢弃渲染视图”的逻辑
+        // （要求另有 adItem/角标/上滑关键字 才保留），结果把“整页读不到字”的直播广告全丢掉了
+        // —— 实测：`rv=true tex=true textLen=0 adItem=false` → 直接上滑被丢弃 → 永远跳不过。
+        //
+        // 历史包袱说明（供将来参考）：
+        // - 1.0.16 曾**无条件**丢弃渲染视图，导致小米平板 5 上真广告漏判（那条 `adItem=true`）；
+        // - 10-31 改成“有条件丢弃”：既不漏平板那条，也保住横屏正剧；
+        // - 但它同时把“读不到字”的广告（拿不到角标/关键字）一起挡掉了。
+        //
+        // 现在改用**持久化确认**（见下方 `liveAdSinceAt`，与“稀疏树”同一套机制）：
+        // 横屏正剧的“渲染视图残留”是瞬态（广告窗口销毁前那一小会儿），连续观测 800ms 仍然
+        // `rv=true` 就说明它一直挂在画面上 —— 那只能是广告本身。
+        // 依据（AdRules.AD_RENDER_VIEW_ID 注释）：5 份正剧样本（播放中/暂停/控件可见）
+        // 全部是 SurfaceView、都不含 `ttlive_player_render_view`；4+ 份直播广告全部含。
+        if (action != null && frameW > frameH &&
             fgPkg == AdRules.HONGUO_PACKAGE && action.reason == AdRules.REASON_LIVE_AD
         ) {
-            val hasOtherPositive = AdRules.hasAdItemContainer(nodes) ||
-                AdRules.hasAdBadge(nodes, frameW, frameH) ||
-                AdRules.hasSwipeHint(pageText)
-            if (hasOtherPositive) {
-                Log.d(TAG, "横屏策略：渲染视图另有独立证据，保留动作 ${action.reason}")
-            } else {
-                Log.d(TAG, "横屏策略：忽略渲染视图判据 ${action.reason}，改由橙色按钮判定")
-                action = null
-            }
+            Log.d(TAG, "横屏渲染视图：保留动作 ${action.reason}（800ms 持久化确认）")
         }
         // 1) 横屏「读不到字 + 连视频层都没有」= 创意自绘（试玩/落地页广告）。
         //    ⚠️ **2026-11-11 已停用（LANDSCAPE_NO_SURFACE_ENABLED = false）**：
@@ -924,6 +928,29 @@ class AdDetector(private val service: AccessibilityService) {
                 return
             }
         }
+        // “直播渲染视图”判据的**持久化确认**（2026-11-11，替代原“横屏丢弃”逻辑）。
+        // 为什么要确认：横屏正剧可能因为**采集残留**（同包名的非活动窗口还没销毁）而短暂读到
+        // `rv=true`；而这类残留是瞬态的（实测过渡帧只有 400ms 量级）。连续观测满
+        // [AD_ITEM_CONFIRM_MS] 仍是 `rv=true`，说明它一直挂在画面上 —— 那只能是广告本身
+        // （依据：5 份正剧样本全部不含 `ttlive_player_render_view`，4+ 份直播广告全部含）。
+        if (action?.reason != AdRules.REASON_LIVE_AD) {
+            liveAdSinceAt = 0L
+        } else {
+            val nowLive = SystemClock.uptimeMillis()
+            if (liveAdSinceAt == 0L) liveAdSinceAt = nowLive
+            val heldLive = nowLive - liveAdSinceAt
+            if (heldLive < AD_ITEM_CONFIRM_MS) {
+                Log.d(
+                    TAG,
+                    "疑似广告(直播渲染视图 rv=true 横屏=${frameW > frameH} " +
+                        "textLen=${pageText.length}) 已持续 ${heldLive}ms，" +
+                        "${AD_ITEM_CONFIRM_MS - heldLive}ms 后确认",
+                )
+                scheduleRetry((AD_ITEM_CONFIRM_MS - heldLive).coerceAtLeast(50L), "渲染视图确认")
+                recycleAll(nodes)
+                return
+            }
+        }
         if (action != null) {
             // **调试观察模式**：自动跳过关闭、只开着调试浮层 → 只显示判定结果，绝不执行动作。
             // 这样排查时可以放心盯着调试浮层看，不会把正在看的内容划走。
@@ -1046,6 +1073,7 @@ class AdDetector(private val service: AccessibilityService) {
             val ok = perform(action)
             // 动作后清零：避免紧接着的“广告→正剧”过渡帧（仍满足稀疏条件）被立即再次划走
             if (action.reason == AdRules.REASON_SPARSE_AD) sparseAdSinceAt = 0L
+            if (action.reason == AdRules.REASON_LIVE_AD) liveAdSinceAt = 0L
             if (action.reason == AdRules.REASON_LANDSCAPE_NO_SURFACE) landscapeNoSurfaceSinceAt = 0L
             Log.i(TAG, "执行${if (ok) "成功" else "失败"}: ${action.type} (${action.reason})")
             traceOutcome("→ ${action.type}（${action.reason}）${if (ok) "已执行" else "执行失败"}")
