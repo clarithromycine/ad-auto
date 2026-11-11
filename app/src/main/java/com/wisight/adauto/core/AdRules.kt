@@ -206,6 +206,21 @@ object AdRules {
      */
     const val REASON_HINT_BAR_AD = "广告(底部上滑提示栏)"
 
+    /**
+     * “竖屏素材塞进横屏容器”（pillarbox）的判定原因（视觉判据，见 AdDetector.computePillarbox）。
+     *
+     * 现场样本（2026-11-09，小米 M656BA / Android 17 / 3200x2136 横屏 / 红果 7.4.3.32）：
+     * 画面是**横屏里的一个竖屏直播电商创意**，左右两侧用同一帧的模糊放大填充。
+     * 调试浮层：`textLen=0 rv=false tex=true adItem=false sparse=false cd=false
+     * landNoSurf=false surface=true scroll=true webView=false`（21 节点 / 2 个 ViewPager），
+     * 四条结构判据全灭：TextureView 与稀疏树都仅限竖屏、且要求无可滚动容器；
+     * 横屏无视频层要求 `surface=false`，而这里有视频层。
+     *
+     * 判据：横屏中部条带内“两侧能量低 / 中间能量高”——竖屏素材的左右边界是竖直的，
+     * 任意水平切片都能看到，所以两侧必定是模糊填充（或纯黑边），与铺满的正剧可分。
+     */
+    const val REASON_PILLARBOX_AD = "广告(横屏竖屏素材)"
+
     /** 整页读不到字（广告创意自绘）的判定：与「稀疏树」共用同一个文字上限 */
     fun isContentlessPage(pageText: String): Boolean = pageText.length <= SPARSE_AD_MAX_TEXT_LEN
 
