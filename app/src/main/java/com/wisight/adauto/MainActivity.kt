@@ -94,9 +94,11 @@ class MainActivity : AppCompatActivity() {
             // “关闭悬浮球”不是移除窗口，而是把球体变成完全透明（见 FloatingBallService.updateBallStyle）：
             // 窗口保留 → 前台服务不必停 → App 不会被 MIUI/HyperOS 在后台挂起（否则就不会跳广告了）。
             if (checked) startBall() else FloatingBallService.start(this)
+            setBallAlphaControlsEnabled(checked)
         }
         // “自动跳过范围”开关只改 UI 状态提示，真正写入要等点“保存规则”（与包名输入框同组）
         binding.switchGenericMode.setOnCheckedChangeListener { _, _ -> updateScopeStatus() }
+        setupBallAlphaControls()
         // 调试浮层：即时生效（不归“保存规则”管）
         binding.switchDebugOverlay.setOnCheckedChangeListener { _, checked ->
             SettingsManager.debugOverlayEnabled = checked
@@ -133,6 +135,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 悬浮球透明度：滑杆（10%~100%，步长 5）。
+     * 拖动即时生效（直接改运行中服务的球体 alpha），并持久化到设置。
+     */
+    private fun setupBallAlphaControls() {
+        binding.sliderBallAlpha.value = SettingsManager.ballAlpha.toFloat()
+        updateBallAlphaLabel(SettingsManager.ballAlpha)
+        // 程序性 setValue 也会回调，所以先 set 再挂监听
+        binding.sliderBallAlpha.addOnChangeListener { _, value, _ ->
+            applyBallAlpha(value.toInt())
+        }
+    }
+
+    private fun applyBallAlpha(alpha: Int) {
+        val clamped = alpha.coerceIn(SettingsManager.BALL_ALPHA_MIN, SettingsManager.BALL_ALPHA_MAX)
+        SettingsManager.ballAlpha = clamped
+        updateBallAlphaLabel(clamped)
+        FloatingBallService.instance?.refreshBallStyle()
+    }
+
+    private fun updateBallAlphaLabel(alpha: Int) {
+        binding.tvBallAlphaValue.text = getString(R.string.ball_alpha_value, alpha)
+    }
+
+    /** 悬浮球关闭时透明度无意义：把控件置灰，避免误解 */
+    private fun setBallAlphaControlsEnabled(enabled: Boolean) {
+        binding.sliderBallAlpha.isEnabled = enabled
+        binding.layoutBallAlpha.alpha = if (enabled) 1f else 0.4f
+    }
+
     private fun refreshStatus() {
         val a11y = isAccessibilityEnabled()
         val overlay = isOverlayEnabled()
@@ -150,6 +182,7 @@ class MainActivity : AppCompatActivity() {
         binding.switchSkip.isChecked = SettingsManager.adSkipEnabled
         binding.switchBall.isChecked = SettingsManager.ballEnabled
         binding.switchDebugOverlay.isChecked = SettingsManager.debugOverlayEnabled
+        setBallAlphaControlsEnabled(SettingsManager.ballEnabled)
 
         binding.tvOverallStatus.setText(
             if (a11y && overlay) R.string.status_enabled else R.string.status_disabled

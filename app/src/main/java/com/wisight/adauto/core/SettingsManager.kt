@@ -15,6 +15,15 @@ object SettingsManager {
     private const val KEY_SUPPORTED_PACKAGES = "supported_packages"
     private const val KEY_GENERIC_MODE = "generic_mode"
     private const val KEY_DEBUG_OVERLAY = "debug_overlay"
+    private const val KEY_BALL_ALPHA = "ball_alpha"
+
+    /** 悬浮球透明度（百分比）下限：再低就基本看不见、也难点中 */
+    const val BALL_ALPHA_MIN = 10
+
+    /** 悬浮球透明度（百分比）上限 = 完全不透明 */
+    const val BALL_ALPHA_MAX = 100
+
+    private const val BALL_ALPHA_DEFAULT = BALL_ALPHA_MAX
 
     private lateinit var prefs: SharedPreferences
 
@@ -35,6 +44,20 @@ object SettingsManager {
         get() = prefs.getBoolean(KEY_BALL_ENABLED, true)
         set(value) {
             prefs.edit().putBoolean(KEY_BALL_ENABLED, value).apply()
+        }
+
+    /**
+     * 悬浮球透明度（百分比，[BALL_ALPHA_MIN]~[BALL_ALPHA_MAX]）。
+     * 只影响“显示中的球体”，与 [ballEnabled] 的隐藏状态互不干扰：
+     * 隐藏时球体恒为完全透明且不接收触摸（见 FloatingBallService.updateBallStyle）。
+     */
+    var ballAlpha: Int
+        get() = prefs.getInt(KEY_BALL_ALPHA, BALL_ALPHA_DEFAULT)
+            .coerceIn(BALL_ALPHA_MIN, BALL_ALPHA_MAX)
+        set(value) {
+            prefs.edit()
+                .putInt(KEY_BALL_ALPHA, value.coerceIn(BALL_ALPHA_MIN, BALL_ALPHA_MAX))
+                .apply()
         }
 
     /** 用户自定义“跳过”按钮关键词，逗号分隔 */

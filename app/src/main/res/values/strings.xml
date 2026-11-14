@@ -26,6 +26,9 @@
     <string name="feature_skip_desc">检测到广告时自动点击“跳过”/“关闭”或执行上滑手势</string>
     <string name="feature_ball_title">显示悬浮球</string>
     <string name="feature_ball_desc">在左上角显示可拖动的控制球，点击可快捷开关自动跳过；关闭后球体变为完全透明（窗口保留），以免后台被系统挂起</string>
+    <string name="feature_ball_alpha_title">悬浮球透明度</string>
+    <string name="feature_ball_alpha_desc">看剧时调低可减少遮挡；球体仍可拖动和点击，自动跳过不受影响</string>
+    <string name="ball_alpha_value">%1$d%%</string>
 
     <string name="section_rules">规则设置</string>
     <string name="rule_custom_title">自定义“跳过”按钮关键词</string>

@@ -251,8 +251,8 @@ class FloatingBallService : Service() {
         val view = ballView ?: return
         val params = layoutParams ?: return
         if (SettingsManager.ballEnabled) {
-            // 显示：恢复正常不透明度与背景，并恢复可触摸
-            view.alpha = 1f
+            // 显示：按用户设置的透明度渲染（100% = 完全不透明），并恢复可触摸
+            view.alpha = SettingsManager.ballAlpha / 100f
             view.background = ContextCompat.getDrawable(
                 this,
                 if (SettingsManager.adSkipEnabled) R.drawable.bg_ball else R.drawable.bg_ball_disabled,
@@ -274,6 +274,13 @@ class FloatingBallService : Service() {
         val intent = Intent(this, MainActivity::class.java)
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         startActivity(intent)
+    }
+
+    /**
+     * 设置页拖动「悬浮球透明度」滑杆后调用，让球体外观即时生效（无需重启服务）。
+     */
+    fun refreshBallStyle() {
+        updateBallStyle()
     }
 
     // ==================== 调试浮层 ====================
