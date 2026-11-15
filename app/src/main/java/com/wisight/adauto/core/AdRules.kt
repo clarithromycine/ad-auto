@@ -172,7 +172,7 @@ object AdRules {
      *   才能真正区分“全屏创意”与“内容列表页”。
      *
      * ⚠️ 这是“缺失型”判据：**广告 → 正剧的过渡帧**同样满足，所以调用方必须做**持久性确认**：
-     * AdDetector 里连续观测满 `AD_ITEM_CONFIRM_MS`（800ms）才动手，且动作后清零重新确认。
+     * AdDetector 里连续观测满 `PersistenceGate` 的确认时长（800ms）才动手，且动作后清零重新确认。
      *
      * @param hasVideoSurface 页面是否有 SurfaceView/TextureView；纯图片列表页没有视频表面。
      * @param hasScrollableContent 页面是否有可滚动容器；内容列表页一定有，全屏广告创意没有。
@@ -195,11 +195,18 @@ object AdRules {
         return !hasPlaybackControls(pageText)
     }
 
-    /** “横屏全屏创意且没有任何视频层”的判定原因 */
+    /**
+     * “横屏全屏创意且没有任何视频层”的判定原因。
+     *
+     * ⚠️ **当前没有任何代码会产生这个 reason**：2026-11-11 起该判据停用
+     * （原因与教训见 `AdDetector.isLandscapeAmbiguous` 的注释）。常量保留是为了
+     * 让历史日志仍可读懂；信号本身仍由 [looksLikeLandscapeAdWithoutSurface] 计算，
+     * 只用于调试浮层展示。
+     */
     const val REASON_LANDSCAPE_NO_SURFACE = "广告(横屏无视频层)"
 
     /**
-     * “底部「∧ 上滑继续看短剧」提示栏”的判定原因（视觉判据，见 AdDetector.computeBottomHintBar）。
+     * “底部「∧ 上滑继续看短剧」提示栏”的判定原因（视觉判据，见 `vision.BottomHintBar`）。
      *
      * 红果在广告/创意页底部会盖一条**纯黑底 + 居中白色小字**的提示栏，文案是「∧ 上滑继续看短剧」。
      * 这条栏是 **App 自己的 UI**（不是广告创意），语义等于“你现在不在正剧播放页”。
@@ -211,7 +218,7 @@ object AdRules {
     const val REASON_HINT_BAR_AD = "广告(底部上滑提示栏)"
 
     /**
-     * “竖屏素材塞进横屏容器”（pillarbox）的判定原因（视觉判据，见 AdDetector.computePillarbox）。
+     * “竖屏素材塞进横屏容器”（pillarbox）的判定原因（视觉判据，见 `vision.Pillarbox`）。
      *
      * 现场样本（2026-11-09，小米 M656BA / Android 17 / 3200x2136 横屏 / 红果 7.4.3.32）：
      * 画面是**横屏里的一个竖屏直播电商创意**，左右两侧用同一帧的模糊放大填充。

@@ -52,7 +52,31 @@
 | `compare_ui.py` | 多份 dump 对比：节点数、id 集合、类名直方图、两两差异 | 找广告页与正剧页的区分点 |
 | `series_scan.py` | 按固定间隔连续抓取，打印每帧指纹 | 广告一闪而过、单帧抓不准时 |
 | `ad_audit.py` | 独立抓屏审计：不依赖 App 判定，检查是否**漏跳** | 怀疑"App 明明该跳却没跳" |
-| `orange_probe.py` | 复现横屏「橙色按钮」判据（形状 A/B + 颜色纯度 + 近似矩形） | 横屏广告跳不过时，看按钮为什么没被认出来 |
+| `orange_probe.py` | 复现横屏「橙色按钮」判据（形状 A/B + 近似矩形）；**与 `vision/OrangeButton.kt` 逐条对齐**，颜色纯度只打印不判定 | 横屏广告跳不过时，看按钮为什么没被认出来 |
+| `make_fixtures.py` | 生成像素判据回归语料（合成帧 → PNG，只依赖标准库） | 新增/重标定像素判据后重建语料 |
+| `fixture_check.py` | 拿语料回归 Python 侧的橙色判据，和 Kotlin 单测比对结论 | 怀疑 Kotlin / Python 两套实现漂移时 |
+
+## 回归语料（`app/src/test/resources/fixtures`）
+
+像素判据（橙色按钮 / 底部提示栏 / 信箱）是纯函数，可以脱离真机单测：
+
+- 语料文件名自带期望结论：`<criterion>_<slug>_<hit|miss>.png`，
+  `criterion ∈ {orange, hint, pillar}`。
+- Kotlin 单测 `PixelSignalCorpusTest` 会**自动**遍历目录（按前缀分组），
+  真机截图转成 PNG 后直接丢进去即可纳入回归，不需要改测试代码。
+- `make_fixtures.py` 生成的是按实测样本重建的**合成帧**；`fixture_check.py`
+  用同一批 PNG 校验 Python 侧实现。Python 只镜像了橙色判据，
+  hint / pillar 只有 Kotlin 实现 —— 有意不再复制第二份，避免扩大双实现漂移面。
+
+```bash
+python3 make_fixtures.py                 # 重建语料
+python3 fixture_check.py                 # Python 侧回归（对齐检查）
+cd ../.. && ./gradlew :app:testDebugUnitTest --tests 'com.wisight.adauto.core.vision.*'
+```
+
+> 2026-11-15 修过一次真实漂移：`orange_probe.py` 的填充率下限是 0.65（Kotlin 0.80）、
+> 行/列跨度覆盖是 0.70/0.70（Kotlin 0.90/0.88），而且它把颜色纯度当判定条件、
+> 按单像素采样 —— 同一条按钮两边可能给出相反结论。现在两份实现逐条对齐。
 
 ## sample/ui_dump.xml
 

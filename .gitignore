@@ -20,3 +20,6 @@
 
 # 界面诊断脚本的抓取产物（截图 / dump）
 /tools/ui-diagnose/cap/
+
+# Python 工具的字节码缓存
+__pycache__/
